@@ -14,9 +14,9 @@ permissions:
 jobs:
   database-review:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
-      - name: Checkout
+      - name: Checkout database repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -28,6 +28,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.0'
+          cache: false
 
       - name: Python syntax check
         run: python -m py_compile src/prepare_db.py
@@ -92,6 +98,35 @@ jobs:
             print("schema verification OK");
           '
 
-      - name: Mongo logs on failure
+      - name: Checkout matching backend branch
+        uses: actions/checkout@v4
+        with:
+          repository: taufikiqbalr/agem
+          ref: qring-v3-sdk-overhaul
+          path: agem
+
+      - name: Verify backend accepts DB-prepared schema
+        shell: bash
+        env:
+          ADDR: :18081
+          MONGODB_URI: mongodb://127.0.0.1:27017/regene_kalaagem
+        run: |
+          cd agem
+          nohup go run ./cmd/api >/tmp/agem-cross-schema.log 2>&1 &
+          echo $! >/tmp/agem-cross-schema.pid
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:18081/healthz >/dev/null; then
+              kill "$(cat /tmp/agem-cross-schema.pid)" || true
+              exit 0
+            fi
+            sleep 2
+          done
+          cat /tmp/agem-cross-schema.log
+          exit 1
+
+      - name: Logs on failure
         if: failure()
-        run: docker logs kala-agem-ci-mongo || true
+        shell: bash
+        run: |
+          cat /tmp/agem-cross-schema.log || true
+          docker logs kala-agem-ci-mongo || true
