@@ -156,7 +156,18 @@
     "raw_sensor_sample_keys",
   ].forEach(ensureRegularCollection);
 
-  // Device registry and active ownership.
+  // Device registry and active ownership. MongoDB partial indexes support
+  // equality and $exists:true, but not $exists:false. Backfill an explicit
+  // active flag on legacy rows before creating partial unique indexes.
+  appDb.getCollection("user_devices").updateMany(
+    { active: { $exists: false }, unpaired_at: { $exists: false } },
+    { $set: { active: true } }
+  );
+  appDb.getCollection("user_devices").updateMany(
+    { active: { $exists: false }, unpaired_at: { $exists: true } },
+    { $set: { active: false, is_primary: false } }
+  );
+
   ensureIndex("devices", { device_uid: 1 }, { unique: true, name: "uniq_device_uid" });
   ensureIndex("devices", { last_seen_at: -1 }, { name: "idx_devices_last_seen_v3" });
 
@@ -171,7 +182,7 @@
     {
       unique: true,
       name: "uniq_user_active_device_v3",
-      partialFilterExpression: { unpaired_at: { $exists: false } },
+      partialFilterExpression: { active: true },
     }
   );
   ensureIndex(
@@ -180,7 +191,7 @@
     {
       unique: true,
       name: "uniq_device_active_owner_v3",
-      partialFilterExpression: { unpaired_at: { $exists: false } },
+      partialFilterExpression: { active: true },
     }
   );
   ensureIndex(
@@ -189,7 +200,7 @@
     {
       unique: true,
       name: "uniq_user_primary_active_v3",
-      partialFilterExpression: { unpaired_at: { $exists: false }, is_primary: true },
+      partialFilterExpression: { active: true, is_primary: true },
     }
   );
 
