@@ -1,185 +1,180 @@
-# db-kala-agem
+# db-kala-agem — QRing SDK v3 MongoDB Schema
 
-MongoDB database service for the AGEM wearable backend. 
+MongoDB schema and housekeeping repository for the AGEM/QRing wearable backend.
 
-This database does not use SQL tables. The table equivalent is a MongoDB
-collection, and each row equivalent is a BSON document.
-
-Default application database name:
+Default database:
 
 ```text
 regene_kalaagem
 ```
 
-## Collection Types
+The schema is aligned with the canonical backend endpoint:
+
+```text
+POST /v3/wearable/sync
+```
+
+The v3 design stores device-local historical data explicitly and no longer treats one monolithic daily snapshot as the authoritative source. `wearable_syncs` now records sync metadata/coverage while normalized collections hold the real domain data.
+
+## Design principles
+
+1. **Device-local day is explicit.** Historical SDK data is stored with `device_date` / `sleep_date` instead of deriving a day from the latest UTC timestamp.
+2. **High-volume immutable data uses MongoDB time-series collections.**
+3. **Mutable summaries/sessions use regular collections.**
+4. **Time-series idempotency uses separate regular key collections.**
+5. **Main sleep and nap/lunch sleep are separate sessions.**
+6. **Manual/one-click/automatic measurements can coexist at the same timestamp.**
+7. **Raw PPG/accelerometer-like samples have shorter retention than normalized health data.**
+8. **A wearable has at most one active owner and a user has at most one active primary device.**
+
+---
+
+# Collection inventory
 
 | Collection | Type | Purpose |
-| --- | --- | --- |
-| `users` | Regular collection | Local AGEM fallback/cache user identity records. Canonical users can live in Regene `users`. |
-| `devices` | Regular collection | Wearable device registry. |
-| `user_devices` | Regular collection | User to device pairing records. |
-| `steps_15m` | Time series collection | 15-minute step/activity measurements. |
-| `steps_15m_keys` | Regular collection | Unique ingest keys for `steps_15m` idempotency. |
-| `daily_activity` | Regular collection | Daily totals from the qring SDK `BleStepTotal` object. |
-| `health_metrics` | Time series collection | Generic qring sensor readings such as heart rate, SpO2, BP, HRV, stress, temperature, and raw PPG. |
-| `health_metric_keys` | Regular collection | Unique ingest keys for `health_metrics` idempotency. |
-| `device_events` | Time series collection | Generic qring device notifications and raw event payloads. |
-| `device_event_keys` | Regular collection | Unique ingest keys for `device_events` idempotency. |
-| `sleep_summary` | Regular collection | One nightly sleep summary per device and sleep date. |
-| `sleep_segments` | Time series collection | Sleep stage timeline measurements. |
-| `sleep_segments_keys` | Regular collection | Unique ingest keys for `sleep_segments` idempotency. |
-| `wearable_syncs` | Regular collection | Latest preserved QRing-style sync snapshot per `device_uid + sync_date`. |
-| `total_activities` | Regular collection | Daily target progress rows from the sync payload `totalActivities` array. |
-| `workouts` | Regular collection | Workout session records. Kept regular because the API supports patch/delete. |
+|---|---|---|
+| `users` | regular | Local fallback user identity. Canonical identity may come from Regene. |
+| `devices` | regular | Device registry, metadata, capabilities, current battery/charging state. |
+| `user_devices` | regular | Pairing history with active ownership constraints. |
+| `daily_activity` | regular | Device-local daily activity totals. |
+| `steps_15m` | time series | 15-minute activity buckets. |
+| `health_metrics` | time series | Normalized HR/SpO2/BP/HRV/stress/temperature/RRI/battery measurements. |
+| `sleep_sessions` | regular | Main sleep and nap/lunch sleep sessions. |
+| `sleep_segments` | time series | Sleep stage timeline segments. |
+| `sleep_summary` | regular | One derived daily sleep aggregate per device/date. |
+| `workouts` | regular | Sport/training sessions. |
+| `device_events` | time series | Sedentary, charging, gesture, sport-status and generic events. |
+| `raw_sensor_samples` | time series | Optional high-volume raw diagnostic channels. |
+| `total_activities` | regular | Daily goal/target/progress rows. |
+| `wearable_syncs` | regular | Per-device/day latest v3 sync metadata and coverage. |
+| `steps_15m_keys` | regular | Legacy/v1 + v3 activity-bucket idempotency. |
+| `health_metric_keys` | regular | Legacy v1 health idempotency. |
+| `sleep_segments_keys` | regular | Legacy v1 sleep-segment idempotency. |
+| `device_event_keys` | regular | Legacy v1 event idempotency. |
+| `health_metric_v3_keys` | regular | v3 measurement idempotency including mode/session/source. |
+| `sleep_segment_v3_keys` | regular | v3 sleep-segment idempotency per session. |
+| `device_event_v3_keys` | regular | v3 event idempotency including session/source. |
+| `raw_sensor_sample_keys` | regular | v3 raw-sample idempotency. |
 
-## Time Series Settings
+---
 
-| Collection | `timeField` | `metaField` | Granularity | Notes |
-| --- | --- | --- | --- | --- |
-| `steps_15m` | `ts_utc` | `device_id` | `minutes` | One measurement per 15-minute device bucket. |
-| `health_metrics` | `ts_utc` | `device_id` | `seconds` | Flexible sensor readings from automatic/manual qring SDK data. |
-| `device_events` | `ts_utc` | `device_id` | `seconds` | Flexible device notifications and raw SDK event payloads. |
-| `sleep_segments` | `start_utc` | `device_id` | `minutes` | One measurement per sleep stage segment. |
+# Time-series configuration
 
-`device_id` is stable and commonly used in queries, so it is used as the
-MongoDB time series `metaField`.
+| Collection | `timeField` | `metaField` | Granularity | Default retention |
+|---|---|---|---|---:|
+| `steps_15m` | `ts_utc` | `device_id` | minutes | 365 days |
+| `sleep_segments` | `start_utc` | `device_id` | minutes | 365 days |
+| `health_metrics` | `ts_utc` | `device_id` | seconds | 365 days |
+| `device_events` | `ts_utc` | `device_id` | seconds | 90 days |
+| `raw_sensor_samples` | `ts_utc` | `device_id` | seconds | 30 days |
 
-Important constraints:
+Retention environment variables:
 
-| Constraint | Impact |
-| --- | --- |
-| Existing regular collections cannot be converted to time series. | The deployment switches to new `*-timeseries-data` volumes so Mongo starts with empty time series collections. |
-| Time series collections cannot use unique indexes. | Idempotency should use the regular `*_keys` collections. |
-| Time series measurement fields are not suitable for patch/upsert updates. | Backend writes should insert measurements and use key collections to avoid duplicates. |
+```text
+KALA_AGEM_RAW_RETENTION_DAYS=365
+KALA_AGEM_EVENT_RETENTION_DAYS=90
+KALA_AGEM_RAW_SENSOR_RETENTION_DAYS=30
+KALA_AGEM_KEY_RETENTION_GRACE_DAYS=7
+```
 
-## Retention And Housekeeping
+Key collections keep duplicate-protection state for the corresponding retention period plus the grace period.
 
-Retention is enabled only for raw timestamped data and idempotency key
-collections. Daily summary collections remain long-lived so API range views do
-not lose historical chart data.
+---
 
-| Data | Collections | Default retention |
-| --- | --- | --- |
-| Raw wearable measurements | `steps_15m`, `sleep_segments`, `health_metrics` | 365 days |
-| Raw device events | `device_events` | 90 days |
-| Raw measurement idempotency keys | `steps_15m_keys`, `sleep_segments_keys`, `health_metric_keys` | 372 days |
-| Device event idempotency keys | `device_event_keys` | 97 days |
-| Daily summaries and snapshots | `daily_activity`, `sleep_summary`, `total_activities`, `wearable_syncs` | no TTL |
-| Raw arrays preserved inside snapshots | `wearable_syncs.payload.*.readings`, `wearable_syncs.payload.sleep.segments` | pruned after 180 days |
-| Identity and pairing data | `users`, `devices`, `user_devices` | no TTL |
+# `devices`
 
-The key collections use the raw retention plus a 7 day grace period. This keeps
-duplicate protection slightly longer than the corresponding time series data.
+Regular device registry. Existing v1 fields remain compatible; v3 adds capability/state fields.
 
-Implementation details:
-
-| Mechanism | Applies to |
-| --- | --- |
-| MongoDB time series `expireAfterSeconds` | `steps_15m`, `sleep_segments`, `health_metrics`, `device_events` |
-| TTL indexes on `created_at` | `steps_15m_keys`, `sleep_segments_keys`, `health_metric_keys`, `device_event_keys` |
-| Snapshot pruning update | Removes raw nested arrays from old `wearable_syncs` documents while preserving summary fields. |
-| DB helper housekeeping | Applies `collMod` and TTL indexes to existing deployments during Drone deploy. |
-
-## Type Conventions
-
-| Type | Meaning |
-| --- | --- |
-| `ObjectId` | MongoDB document ID. |
-| `String` | BSON string. |
-| `Int32/Int64` | BSON integer. |
-| `Double` | BSON floating-point number. |
-| `Date` | BSON datetime stored in UTC. API input/output uses RFC3339. |
-| `Boolean` | BSON boolean. |
-| `Object` | Embedded BSON document. |
-| `Array` | BSON array. |
-| `Null` | Optional value may be missing or stored as `null`, depending on write path. |
-
-Date strings:
-
-| Field style | Example | Notes |
-| --- | --- | --- |
-| RFC3339 timestamp | `2026-05-19T08:00:00Z` | Used for UTC instants. |
-| Device-local date | `2026-05-19` | Used for `device_date` and `sleep_date`. |
-
-## users
-
-Regular collection for local fallback user profile records. In deployed AGEM
-environments, canonical user identity can be read from the Regene `users`
-collection through the `nasabah_regene_*` secret. This collection remains for
-local development and older AGEM-only records.
-
-| Field | BSON type | Required | Notes |
-| --- | --- | --- | --- |
-| `_id` | `ObjectId` | yes | Primary document ID. API returns this as `id`. |
-| `email` | `String` | no | User email. |
-| `phone` | `String` | no | User phone number. |
-| `created_at` | `Date` | yes | Created timestamp in UTC. |
-| `updated_at` | `Date` | yes | Last updated timestamp in UTC. |
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `_id` | ObjectId | yes | Internal AGEM device ID. |
+| `device_uid` | String | yes | Stable QRing/front-end device UID. Unique. |
+| `vendor` | String | yes | Defaults to `QRing` for v3 auto-registration. |
+| `model` | String | no | Example: `G69`. |
+| `hw_rev` | String | no | Hardware revision. |
+| `fw_rev` | String | no | Firmware revision. |
+| `serial_number` | String | no | Manufacturer serial. |
+| `sdk_version` | String | no | Frontend SDK version, e.g. `2025-08-26`. |
+| `capabilities` | Object | no | Boolean capability map reported by SDK/device. |
+| `battery_percent` | Int | no | Current battery 0..100. |
+| `charging` | Boolean | no | Current charging state. |
+| `first_seen_at` | Date | yes | First registration/sync. |
+| `last_seen_at` | Date | no | Last successful v3 sync/device state time. |
+| `state_updated_at` | Date | no | Last device-state update. |
+| `created_at` | Date | yes | Creation time. |
+| `updated_at` | Date | yes | Last metadata update. |
 
 Indexes:
 
-| Name | Fields | Unique |
-| --- | --- | --- |
-| `_id_` | `_id` | yes |
+```text
+uniq_device_uid                  UNIQUE(device_uid)
+idx_devices_last_seen_v3        last_seen_at DESC
+```
 
-## devices
+`capabilities` is intentionally schemaless because `SetTimeRsp` and `DeviceSupportFunctionRsp` can evolve between SDK/device models.
 
-Regular collection for wearable device records.
+---
 
-| Field | BSON type | Required | Notes |
-| --- | --- | --- | --- |
-| `_id` | `ObjectId` | yes | Primary document ID. API returns this as `id`. |
-| `vendor` | `String` | yes | Device vendor. |
-| `model` | `String` | no | Device model. |
-| `hw_rev` | `String` | no | Hardware revision. |
-| `fw_rev` | `String` | no | Firmware revision. |
-| `serial_number` | `String` | no | Manufacturer serial number. |
-| `device_uid` | `String` | yes | Stable wearable identifier, for example remote ID or MAC address. |
-| `first_seen_at` | `Date` | yes | First registration timestamp in UTC. |
-| `last_seen_at` | `Date` | no | Last seen timestamp in UTC. |
-| `created_at` | `Date` | yes | Created timestamp in UTC. |
-| `updated_at` | `Date` | yes | Last updated timestamp in UTC. |
+# `user_devices`
 
-Indexes:
+Pairing history. A row remains after unpairing; `unpaired_at` marks it inactive.
 
-| Name | Fields | Unique |
-| --- | --- | --- |
-| `_id_` | `_id` | yes |
-| `uniq_device_uid` | `device_uid` | yes |
-
-## user_devices
-
-Regular collection for pairings between users and devices.
-
-| Field | BSON type | Required | Notes |
-| --- | --- | --- | --- |
-| `_id` | `ObjectId` | yes | Primary document ID. API returns this as `id`. |
-| `user_id` | `String` | yes | User ID. When AGEM is configured with `nasabah_regene_*`, this references Regene `users._id` as a hex string. |
-| `device_id` | `String` | yes | Device ID as returned by the API. |
-| `nickname` | `String` | no | User-facing device nickname. |
-| `is_primary` | `Boolean` | yes | Marks the primary device for a user. |
-| `paired_at` | `Date` | yes | Pairing timestamp in UTC. |
-| `unpaired_at` | `Date` | no | Unpairing timestamp in UTC. |
+| Field | Type | Notes |
+|---|---|---|
+| `_id` | ObjectId | Pairing record ID. |
+| `user_id` | String | Canonical Regene/AGEM user ID. |
+| `device_id` | String | AGEM `devices._id` as hex string. |
+| `nickname` | String | Optional UI nickname. |
+| `is_primary` | Boolean | Active primary device flag. |
+| `paired_at` | Date | Pair time. |
+| `unpaired_at` | Date | Missing while active. |
 
 Indexes:
 
-| Name | Fields | Unique |
-| --- | --- | --- |
-| `_id_` | `_id` | yes |
-| `idx_user_devices_user_primary_paired` | `user_id`, `is_primary`, `paired_at` | no |
+```text
+idx_user_devices_user_primary_paired
+uniq_user_active_device_v3   UNIQUE(user_id, device_id) WHERE unpaired_at missing
+uniq_device_active_owner_v3  UNIQUE(device_id)          WHERE unpaired_at missing
+uniq_user_primary_active_v3  UNIQUE(user_id)            WHERE unpaired_at missing AND is_primary=true
+```
 
-Behavior:
+Migration note: if an existing deployment already has duplicate active pairing rows, the new unique partial indexes will fail to create until those duplicates are resolved.
 
-| Operation | Rule |
-| --- | --- |
-| Pair or update as primary | Other pairings for the same `user_id` should be set to `is_primary=false`. |
-| Unpair | `unpaired_at` is set; the record can remain for history. |
+---
 
-## steps_15m
+# `daily_activity`
 
-Time series collection for 15-minute step/activity measurements.
+One mutable summary per device-local date.
 
-Time series options:
+| Field | Type | Notes |
+|---|---|---|
+| `device_id` | String | AGEM device ID. |
+| `device_date` | String | Device-local `YYYY-MM-DD`. |
+| `tz_offset_min` | Int | Offset used when synced. |
+| `total_steps` | Int | Daily total steps. |
+| `running_steps` | Int | Daily running/aerobic steps. |
+| `calories` | Int | Legacy compatibility; v3 writes the SDK raw calorie integer. |
+| `calories_raw` | Int | Exact raw SDK integer. |
+| `calories_kcal` | Double | Optional normalized kcal supplied by frontend. |
+| `walk_distance_m` | Int | Distance in meters. |
+| `sport_duration_s` | Int | Activity duration in seconds. |
+| `sleep_duration_s` | Int | Daily sleep duration value from SDK daily total, seconds. |
+| `source` | String | Usually `qring_sdk_v3`. |
+| `synced_at` | Date | Last update. |
+
+Unique key:
+
+```text
+device_id + device_date
+```
+
+The backend does not invent a calorie scaling rule. Preserve raw SDK values and optionally supply normalized kcal separately.
+
+---
+
+# `steps_15m`
+
+Time-series representation of `BleStepDetails`.
 
 ```js
 {
@@ -191,435 +186,428 @@ Time series options:
 }
 ```
 
-| Field | BSON type | Required | Notes |
-| --- | --- | --- | --- |
-| `_id` | `ObjectId` | generated | MongoDB document ID. Time series collections do not create the normal `_id_` index. |
-| `device_id` | `String` | yes | Time series `metaField`; device ID as returned by the API. |
-| `ts_utc` | `Date` | yes | Time series `timeField`; UTC timestamp for the 15-minute bucket. |
-| `device_date` | `String` | yes | Device-local date, `YYYY-MM-DD`. |
-| `time_index` | `Int32/Int64` | yes | 15-minute slot index, usually `0..95`. |
-| `tz_offset_min` | `Int32/Int64` | yes | Device timezone offset in minutes. |
-| `walk_steps` | `Int32/Int64` | yes | Walking steps for the bucket. |
-| `run_steps` | `Int32/Int64` | yes | Running steps for the bucket. |
-| `calories` | `Int32/Int64` | yes | Calories for the bucket. |
-| `distance_m` | `Int32/Int64` | yes | Distance in meters for the bucket. |
-| `sport_duration_s` | `Int32/Int64` | no | Active duration in seconds for timestamped v3 activity readings. |
-| `source` | `String` | yes | Defaults to `device` when omitted. v3 activity readings use `wearable_sync_activity_reading`. |
-| `synced_at` | `Date` | yes | Backend sync timestamp in UTC. |
+| Field | Type | Notes |
+|---|---|---|
+| `device_id` | String | Meta field. |
+| `ts_utc` | Date | UTC instant corresponding to local bucket. |
+| `device_date` | String | Explicit local date. |
+| `time_index` | Int | `0..95`, 15-minute bucket. |
+| `tz_offset_min` | Int | Device offset. |
+| `walk_steps` | Int | Walking steps. |
+| `run_steps` | Int | Running steps. |
+| `calories` | Int | Legacy raw calorie field. |
+| `calories_raw` | Int | Explicit raw SDK calorie value. |
+| `calories_kcal` | Double | Optional normalized kcal. |
+| `distance_m` | Int | Distance meters. |
+| `sport_duration_s` | Int | Optional active duration when available from frontend-derived detail. |
+| `source` | String | Ingest source. |
+| `synced_at` | Date | Server ingest time. |
 
-Indexes:
-
-| Name | Fields | Unique | Notes |
-| --- | --- | --- | --- |
-| MongoDB generated | `device_id`, `ts_utc` | no | Default time series meta/time index in MongoDB 6.3+. |
-| `idx_steps_device_date_time` | `device_id`, `device_date`, `time_index` | no | Supports listing by device-local date. |
-
-Daily aggregation fields:
-
-| Output field | Calculation |
-| --- | --- |
-| `day_utc` | `$dateTrunc(ts_utc, day, UTC)` |
-| `total_steps` | Sum of `walk_steps + run_steps`. |
-| `running_steps` | Sum of `run_steps`. |
-| `calories` | Sum of `calories`. |
-| `distance_m` | Sum of `distance_m`. |
-| `last_synced_at` | Max `synced_at` for the day. |
-
-## steps_15m_keys
-
-Regular support collection for idempotent step ingest.
-
-| Field | BSON type | Required | Notes |
-| --- | --- | --- | --- |
-| `_id` | `ObjectId` | yes | Primary document ID. |
-| `device_id` | `String` | yes | Device ID. |
-| `ts_utc` | `Date` | yes | Same timestamp used by `steps_15m.ts_utc`. |
-| `created_at` | `Date` | recommended | First accepted ingest timestamp. |
-
-Indexes:
-
-| Name | Fields | Unique |
-| --- | --- | --- |
-| `_id_` | `_id` | yes |
-| `uniq_steps_device_ts` | `device_id`, `ts_utc` | yes |
-
-## daily_activity
-
-Regular collection for one qring daily activity total per device-local date.
-This stores fields from `BleStepTotal` / `TodaySportDataRsp` that are not
-represented by individual 15-minute step buckets.
-
-| Field | BSON type | Required | Notes |
-| --- | --- | --- | --- |
-| `_id` | `ObjectId` | yes | Primary document ID. |
-| `device_id` | `String` | yes | Device ID as returned by the API. |
-| `device_date` | `String` | yes | Device-local date, `YYYY-MM-DD`. |
-| `tz_offset_min` | `Int32/Int64` | yes | Device timezone offset in minutes. |
-| `total_steps` | `Int32/Int64` | yes | Daily total steps from the device. |
-| `running_steps` | `Int32/Int64` | yes | Daily running/aerobic steps. |
-| `calories` | `Int32/Int64` | yes | Daily calorie total from the device. |
-| `walk_distance_m` | `Int32/Int64` | yes | Daily walking distance in meters. |
-| `sport_duration_s` | `Int32/Int64` | yes | Movement duration in seconds. |
-| `sleep_duration_s` | `Int32/Int64` | yes | Sleep duration in seconds when supplied by the device daily total. |
-| `source` | `String` | yes | Defaults to `device` when omitted. v3 daily activity summaries use `wearable_sync`. |
-| `synced_at` | `Date` | yes | Backend sync timestamp in UTC. |
-
-Indexes:
-
-| Name | Fields | Unique |
-| --- | --- | --- |
-| `_id_` | `_id` | yes |
-| `uniq_daily_activity_device_date` | `device_id`, `device_date` | yes |
-
-## health_metrics
-
-Time series collection for qring sensor data that is not already modeled by
-steps, sleep, or workouts. It is intentionally flexible so the Android side can
-store automatic readings, manual readings, one-click measurements, and raw SDK
-packets without a schema change for every vendor class.
-
-Time series options:
-
-```js
-{
-  timeseries: {
-    timeField: "ts_utc",
-    metaField: "device_id",
-    granularity: "seconds"
-  }
-}
-```
-
-| Field | BSON type | Required | Notes |
-| --- | --- | --- | --- |
-| `_id` | `ObjectId` | generated | MongoDB document ID. |
-| `device_id` | `String` | yes | Time series `metaField`; device ID as returned by the API. |
-| `ts_utc` | `Date` | yes | Time series `timeField`; measurement timestamp in UTC. |
-| `metric` | `String` | yes | Metric name, for example `heart_rate`, `spo2`, `blood_oxygen`, `blood_pressure`, `hrv`, `stress`, `temperature`, `rri`, `raw_ppg`, or `battery_level`. |
-| `value` | `Double` or `Null` | no | Scalar reading, such as heart rate or SpO2. |
-| `values` | `Object` | no | Multi-value numeric reading, such as `{systolic, diastolic, heart_rate}`, `{average, min, max, readings_count}`, or raw PPG channel values. |
-| `unit` | `String` | no | Measurement unit, for example `bpm`, `%`, `mmHg`, `celsius`, or `ms`. |
-| `source` | `String` | yes | Defaults to `device` when omitted. v3 summary points use `wearable_sync`; v3 raw readings use `wearable_sync_reading`. |
-| `metadata` | `Object` | no | SDK-specific details such as class name, offset, range, time index, or quality flags. |
-| `synced_at` | `Date` | yes | Backend sync timestamp in UTC. |
-
-Indexes:
-
-| Name | Fields | Unique | Notes |
-| --- | --- | --- | --- |
-| MongoDB generated | `device_id`, `ts_utc` | no | Default time series meta/time index in MongoDB 6.3+. |
-| `idx_health_metrics_device_metric_ts` | `device_id`, `metric`, `ts_utc` | no | Supports listing one metric by time range. |
-
-## health_metric_keys
-
-Regular support collection for idempotent health metric ingest.
-
-| Field | BSON type | Required | Notes |
-| --- | --- | --- | --- |
-| `_id` | `ObjectId` | yes | Primary document ID. |
-| `device_id` | `String` | yes | Device ID. |
-| `metric` | `String` | yes | Same metric name used by `health_metrics.metric`. |
-| `ts_utc` | `Date` | yes | Same timestamp used by `health_metrics.ts_utc`. |
-| `source` | `String` | yes | Source namespace for idempotency. |
-| `created_at` | `Date` | recommended | First accepted ingest timestamp. |
-
-Indexes:
-
-| Name | Fields | Unique |
-| --- | --- | --- |
-| `_id_` | `_id` | yes |
-| `uniq_health_metric_device_metric_ts_source` | `device_id`, `metric`, `ts_utc`, `source` | yes |
-
-## device_events
-
-Time series collection for qring notifications and events that are not direct
-health measurements. Examples include battery notifications, touch events,
-sedentary state changes, and raw `DeviceNotifyRsp` payloads.
-
-Time series options:
-
-```js
-{
-  timeseries: {
-    timeField: "ts_utc",
-    metaField: "device_id",
-    granularity: "seconds"
-  }
-}
-```
-
-| Field | BSON type | Required | Notes |
-| --- | --- | --- | --- |
-| `_id` | `ObjectId` | generated | MongoDB document ID. |
-| `device_id` | `String` | yes | Time series `metaField`; device ID as returned by the API. |
-| `ts_utc` | `Date` | yes | Time series `timeField`; event timestamp in UTC. |
-| `event_type` | `String` | yes | Event namespace, for example `battery`, `touch`, `sedentary`, or `device_notify`. |
-| `source` | `String` | yes | Defaults to `device` when omitted. |
-| `payload` | `Object` | no | Raw or normalized SDK payload. |
-| `synced_at` | `Date` | yes | Backend sync timestamp in UTC. |
-
-Indexes:
-
-| Name | Fields | Unique | Notes |
-| --- | --- | --- | --- |
-| MongoDB generated | `device_id`, `ts_utc` | no | Default time series meta/time index in MongoDB 6.3+. |
-| `idx_device_events_device_type_ts` | `device_id`, `event_type`, `ts_utc` | no | Supports listing one event type by time range. |
-
-## device_event_keys
-
-Regular support collection for idempotent device event ingest.
-
-| Field | BSON type | Required | Notes |
-| --- | --- | --- | --- |
-| `_id` | `ObjectId` | yes | Primary document ID. |
-| `device_id` | `String` | yes | Device ID. |
-| `event_type` | `String` | yes | Same event type used by `device_events.event_type`. |
-| `ts_utc` | `Date` | yes | Same timestamp used by `device_events.ts_utc`. |
-| `source` | `String` | yes | Source namespace for idempotency. |
-| `created_at` | `Date` | recommended | First accepted ingest timestamp. |
-
-Indexes:
-
-| Name | Fields | Unique |
-| --- | --- | --- |
-| `_id_` | `_id` | yes |
-| `uniq_device_event_device_type_ts_source` | `device_id`, `event_type`, `ts_utc`, `source` | yes |
-
-## sleep_summary
-
-Regular collection for nightly sleep summary records.
-
-| Field | BSON type | Required | Notes |
-| --- | --- | --- | --- |
-| `_id` | `ObjectId` | yes | Primary document ID. |
-| `device_id` | `String` | yes | Device ID as returned by the API. |
-| `sleep_date` | `String` | yes | Device-local sleep date, `YYYY-MM-DD`. |
-| `tz_offset_min` | `Int32/Int64` | yes | Device timezone offset in minutes. |
-| `sleep_start_utc` | `Date` or `Null` | no | Optional sleep start timestamp in UTC. |
-| `wake_utc` | `Date` or `Null` | no | Optional wake timestamp in UTC. |
-| `total_sleep_s` | `Int32/Int64` | yes | Total sleep duration in seconds. |
-| `deep_s` | `Int32/Int64` | yes | Deep sleep duration in seconds. |
-| `light_s` | `Int32/Int64` | yes | Light sleep duration in seconds. |
-| `awake_s` | `Int32/Int64` | yes | Awake duration in seconds. |
-| `rem_s` | `Int32/Int64` | yes | REM duration in seconds. |
-| `score` | `Int32/Int64` | no | Sleep score from the QRing-style sync payload. |
-| `stage_data` | `Array<Int32/Int64>` | no | Raw stage code array when no per-stage timestamps are available. |
-| `source` | `String` | yes | Defaults to `device` when omitted. v3 sleep summaries use `wearable_sync`. |
-| `synced_at` | `Date` | yes | Backend sync timestamp in UTC. |
-
-Indexes:
-
-| Name | Fields | Unique |
-| --- | --- | --- |
-| `_id_` | `_id` | yes |
-| `uniq_sleep_summary_device_date` | `device_id`, `sleep_date` | yes |
-
-## sleep_segments
-
-Time series collection for sleep stage timeline measurements.
-
-Time series options:
-
-```js
-{
-  timeseries: {
-    timeField: "start_utc",
-    metaField: "device_id",
-    granularity: "minutes"
-  }
-}
-```
-
-| Field | BSON type | Required | Notes |
-| --- | --- | --- | --- |
-| `_id` | `ObjectId` | generated | MongoDB document ID. Time series collections do not create the normal `_id_` index. |
-| `device_id` | `String` | yes | Time series `metaField`; device ID as returned by the API. |
-| `start_utc` | `Date` | yes | Time series `timeField`; segment start timestamp in UTC. |
-| `end_utc` | `Date` | yes | Segment end timestamp in UTC. |
-| `sleep_date` | `String` | yes | Device-local sleep date, `YYYY-MM-DD`. |
-| `tz_offset_min` | `Int32/Int64` | yes | Device timezone offset in minutes. |
-| `stage` | `String` | yes | Defaults to `unknown` when omitted. |
-| `source` | `String` | yes | Defaults to `device` when omitted. v3 timestamped sleep segments use `wearable_sync_sleep_segment`. |
-| `synced_at` | `Date` | yes | Backend sync timestamp in UTC. |
-
-Stage values by convention:
+Query index:
 
 ```text
-deep, light, rem, awake, off_wrist, unknown
+device_id + device_date + time_index
 ```
 
-Indexes:
+Daily UI grouping must use `device_date`, not UTC `$dateTrunc`.
 
-| Name | Fields | Unique | Notes |
-| --- | --- | --- | --- |
-| MongoDB generated | `device_id`, `start_utc` | no | Default time series meta/time index in MongoDB 6.3+. |
-| `idx_sleep_segments_device_date_start` | `device_id`, `sleep_date`, `start_utc` | no | Supports listing by sleep date. |
+---
 
-## sleep_segments_keys
+# `health_metrics`
 
-Regular support collection for idempotent sleep segment ingest.
+Flexible normalized health-measurement time series.
 
-| Field | BSON type | Required | Notes |
-| --- | --- | --- | --- |
-| `_id` | `ObjectId` | yes | Primary document ID. |
-| `device_id` | `String` | yes | Device ID. |
-| `start_utc` | `Date` | yes | Same timestamp used by `sleep_segments.start_utc`. |
-| `created_at` | `Date` | recommended | First accepted ingest timestamp. |
+| Field | Type | Notes |
+|---|---|---|
+| `device_id` | String | Meta field. |
+| `device_date` | String | Explicit local day. |
+| `tz_offset_min` | Int | Device offset. |
+| `ts_utc` | Date | Measurement instant. |
+| `metric` | String | `heart_rate`, `spo2`, `blood_pressure`, `hrv`, `stress`, `temperature`, `rri`, `battery_level`, etc. |
+| `value` | Double | Main normalized scalar. |
+| `values` | Object | Multi-value normalized reading. |
+| `raw_value` | Double | Original SDK raw scalar. |
+| `raw_values` | Object | Original multi-channel values. |
+| `unit` | String | Unit. |
+| `measurement_mode` | String | `automatic`, `history_sync`, `manual`, `one_click`, `realtime`, `derived`, etc. |
+| `session_id` | String | Correlation ID for one measurement session. |
+| `sample_interval_s` | Int | Original interval if known. |
+| `error_code` | Int | SDK measurement error/status. |
+| `derived` | Boolean | Calculated vs directly measured. |
+| `algorithm` | String | Derivation algorithm when applicable. |
+| `source` | String | Source namespace. |
+| `metadata` | Object | Vendor/model-specific fields. |
+| `synced_at` | Date | Server ingest time. |
 
-Indexes:
+Example SpO2 hourly min/max:
 
-| Name | Fields | Unique |
-| --- | --- | --- |
-| `_id_` | `_id` | yes |
-| `uniq_sleep_segments_device_start` | `device_id`, `start_utc` | yes |
+```js
+{
+  metric: "spo2",
+  values: { min: 95, max: 98 },
+  unit: "%",
+  measurement_mode: "history_sync",
+  sample_interval_s: 3600
+}
+```
 
-## wearable_syncs
+Example blood pressure:
 
-Regular collection for preserved v3 wearable sync snapshots. It stores only the
-recognized QRing-style sections, keeping the frontend/device nested shape for
-range reads while normalized records are written to other collections.
+```js
+{
+  metric: "blood_pressure",
+  values: { systolic: 118, diastolic: 76, heart_rate: 72 },
+  unit: "mmHg",
+  measurement_mode: "manual",
+  derived: false
+}
+```
 
-| Field | BSON type | Required | Notes |
-| --- | --- | --- | --- |
-| `_id` | `ObjectId` | yes | Primary document ID. |
-| `device_id` | `String` | yes | Device ID as returned by the API. |
-| `device_uid` | `String` | yes | Stable wearable identifier from `deviceUid` / `device_uid`. |
-| `sync_date` | `String` | yes | Derived device sync date, `YYYY-MM-DD`. |
-| `payload` | `Object` | yes | Recognized nested sync payload sections. |
-| `payload.tzOffsetMin` | `Int32/Int64` | no | Optional timezone offset used to derive date buckets for timestamped activity readings. |
-| `payload.hrv` | `Object` | no | HRV snapshot fields: `current`, `average`, `readingsCount`, `lastUpdated`. |
-| `payload.heartRate` | `Object` | no | Heart-rate snapshot fields: `current`, `average`, `min`, `max`, `readingsCount`, `lastUpdated`. |
-| `payload.spo2` | `Object` | no | SpO2 snapshot fields. |
-| `payload.temperature` | `Object` | no | Temperature snapshot fields including optional `raw`. |
-| `payload.stress` | `Object` | no | Stress snapshot fields. |
-| `payload.*.readings` | `Array<Object>` | no | Optional timestamped readings preserved from HRV, heart rate, SpO2, temperature, stress, activity, and blood pressure sections. |
-| `payload.activity` | `Object` | no | Activity fields: `steps`, `calories`, `distance`, `activeTime`, `lastUpdated`, optional `readings`. |
-| `payload.sleep` | `Object` | no | Sleep fields including minutes, `score`, `sleepStart`, `sleepEnd`, `stageData`, and optional timestamped `segments`. |
-| `payload.bloodPressure` | `Object` | no | BP fields: `systolic`, `diastolic`, `heartRate`, `measurementTime`, `lastUpdated`, optional `readings`. |
-| `payload.totalActivities` | `Array<Object>` | no | Target rows in the original array order. `kind` is preserved when supplied. |
-| `source` | `String` | yes | Stores `wearable_sync`. |
-| `received_at` | `Date` | yes | Backend receive timestamp in UTC. |
-| `created_at` | `Date` | yes | First snapshot creation timestamp. |
-| `updated_at` | `Date` | yes | Last snapshot update timestamp. |
-
-Indexes:
-
-| Name | Fields | Unique |
-| --- | --- | --- |
-| `_id_` | `_id` | yes |
-| `uniq_wearable_sync_device_uid_date` | `device_uid`, `sync_date` | yes |
-| `idx_wearable_sync_device_date` | `device_id`, `sync_date` | no |
-
-## total_activities
-
-Regular collection for the v3 sync payload `totalActivities` array. The backend
-maps indexes `0`, `1`, and `2` to `steps`, `calories`, and `distance`;
-additional indexes are stored as `unknown_<index>`.
-
-| Field | BSON type | Required | Notes |
-| --- | --- | --- | --- |
-| `_id` | `ObjectId` | yes | Primary document ID. |
-| `device_id` | `String` | yes | Device ID as returned by the API. |
-| `device_uid` | `String` | yes | Stable wearable identifier. |
-| `device_date` | `String` | yes | Sync date, `YYYY-MM-DD`. |
-| `kind` | `String` | yes | Explicit `kind` from the payload when supplied; otherwise `steps`, `calories`, `distance`, or `unknown_<index>`. |
-| `index` | `Int32/Int64` | yes | Original array index. |
-| `value` | `Double` or `Null` | no | Current progress value. |
-| `target` | `Double` or `Null` | no | Target value. |
-| `source` | `String` | yes | Stores `wearable_sync` unless overridden by a future writer. |
-| `synced_at` | `Date` | yes | Backend sync timestamp in UTC. |
-
-Indexes:
-
-| Name | Fields | Unique |
-| --- | --- | --- |
-| `_id_` | `_id` | yes |
-| `uniq_total_activities_device_date_kind` | `device_id`, `device_date`, `kind` | yes |
-| `idx_total_activities_device_uid_date` | `device_uid`, `device_date` | no |
-
-## workouts
-
-Regular collection for workout session records.
-
-This collection stays regular because the current API supports patching and
-deleting workouts by `device_id + start_utc`, while MongoDB time series
-collections are not a good fit for mutable measurement documents.
-
-| Field | BSON type | Required | Notes |
-| --- | --- | --- | --- |
-| `_id` | `ObjectId` | yes | Primary document ID. |
-| `device_id` | `String` | yes | Device ID as returned by the API. |
-| `start_utc` | `Date` | yes | Workout start timestamp in UTC. |
-| `end_utc` | `Date` or `Null` | no | Optional workout end timestamp in UTC. |
-| `tz_offset_min` | `Int32/Int64` | yes | Device timezone offset in minutes. |
-| `sport_type_id` | `Int32/Int64` or `Null` | no | Sport type identifier from device/app. |
-| `duration_s` | `Int32/Int64` or `Null` | no | Workout duration in seconds. |
-| `distance_m` | `Int32/Int64` or `Null` | no | Distance in meters. |
-| `calories` | `Double` or `Null` | no | Calories burned. The qring `SportPlusEntity.mCalories` field is a floating-point value. |
-| `avg_hr` | `Int32/Int64` or `Null` | no | Average heart rate. |
-| `max_hr` | `Int32/Int64` or `Null` | no | Maximum heart rate. |
-| `min_hr` | `Int32/Int64` or `Null` | no | Minimum heart rate. |
-| `avg_speed_cm_s` | `Int32/Int64` or `Null` | no | Average speed in centimeters per second. |
-| `max_speed_cm_s` | `Int32/Int64` or `Null` | no | Maximum speed in centimeters per second. |
-| `elevation_cm` | `Int32/Int64` or `Null` | no | Average altitude/elevation in centimeters. |
-| `uphill_cm` | `Int32/Int64` or `Null` | no | Cumulative climb in centimeters. |
-| `downhill_cm` | `Int32/Int64` or `Null` | no | Cumulative downhill in centimeters. |
-| `avg_cadence_spm` | `Int32/Int64` or `Null` | no | Average cadence in steps per minute. |
-| `sport_count` | `Int32/Int64` or `Null` | no | Exercise count from the SDK record. |
-| `steps` | `Int32/Int64` or `Null` | no | Steps inside the workout. |
-| `locations` | `Array<Object>` | no | Optional workout detail samples. Current normalized field is `rate_real`. |
-| `source` | `String` | yes | Defaults to `device` when omitted. |
-| `synced_at` | `Date` | yes | Backend sync timestamp in UTC. |
-
-Indexes:
-
-| Name | Fields | Unique |
-| --- | --- | --- |
-| `_id_` | `_id` | yes |
-| `uniq_workouts_device_start` | `device_id`, `start_utc` | yes |
-
-## Source Values
-
-The backend accepts source strings from API clients. Current conventions:
+v3 idempotency key:
 
 ```text
-device, derived, manual, import, wearable_sync, wearable_sync_reading,
-wearable_sync_activity_reading, wearable_sync_sleep_segment
+device_id + metric + ts_utc + measurement_mode + session_id + source
 ```
 
-If `source` is omitted for wearable ingest routes, the backend stores `device`.
+This intentionally allows automatic and manual measurements at the same timestamp.
 
-## Initialization Flow
+---
 
-The Mongo container prepares `/docker-entrypoint-initdb.d` before starting the
-official Mongo entrypoint:
+# `sleep_sessions`
 
-| Init file | Source | Purpose |
-| --- | --- | --- |
-| `00-mongo-init.js` | Docker secret selected by `INIT_DB` | Creates users/roles from deployment secret. |
-| `10-kala-agem-timeseries.js` | Repo file `src/db/kala-agem-timeseries.js` | Creates AGEM collections, time series collections, and indexes. |
+Regular collection for each sleep episode.
 
-Environment:
+| Field | Type | Notes |
+|---|---|---|
+| `device_id` | String | Device. |
+| `sleep_date` | String | Day bucket assigned by frontend/SDK sync. |
+| `tz_offset_min` | Int | Device offset. |
+| `session_id` | String | Stable session key. Generated from date/type/start if omitted. |
+| `session_type` | String | `main`, `nap`, etc. |
+| `protocol` | String | `legacy`, `new_sleep_protocol`, etc. |
+| `start_utc` | Date | Session start. |
+| `end_utc` | Date | Session end. |
+| `total_sleep_s` | Int | Deep+light+REM when derived from segments. |
+| `deep_s` | Int | Deep sleep. |
+| `light_s` | Int | Light sleep. |
+| `rem_s` | Int | REM. |
+| `awake_s` | Int | Awake. |
+| `waking_count` | Int | Wake episodes. |
+| `stage_data` | Array<Int> | Optional legacy stage array. |
+| `metadata` | Object | SDK details. |
+| `source` | String | Source. |
+| `synced_at` | Date | Sync time. |
+| `created_at` / `updated_at` | Date | Lifecycle. |
 
-| Variable | Default | Notes |
-| --- | --- | --- |
-| `KALA_AGEM_DB` | `regene_kalaagem` | Application database name used by the schema script. |
-| `INIT_DB` | required | Docker secret name containing the deployment init JavaScript. |
-| `KALA_AGEM_RAW_RETENTION_DAYS` | `365` | Retention for raw wearable time series data. |
-| `KALA_AGEM_EVENT_RETENTION_DAYS` | `90` | Retention for raw device event time series data. |
-| `KALA_AGEM_KEY_RETENTION_GRACE_DAYS` | `7` | Extra TTL grace period for idempotency key collections. |
-| `KALA_AGEM_SNAPSHOT_READING_RETENTION_DAYS` | `180` | Age after which raw arrays inside `wearable_syncs` snapshots are pruned. |
+Unique:
 
-Deployment ports:
+```text
+device_id + session_id
+```
 
-| Environment | Mongo service | Published port | Active volume | Old volume |
-| --- | --- | --- | --- | --- |
-| test | `mongo-kala-agem-test` | `57215` | `mongo-kala-agem-test-timeseries-data` | `mongo-kala-agem-test-data` |
-| dev | `mongo-kala-agem-dev` | `47215` | `mongo-kala-agem-dev-timeseries-data` | `mongo-kala-agem-dev-data` |
+This collection solves the old one-sleep-row-per-day limitation and supports both main and lunch/nap sleep.
 
-The schema script runs only when MongoDB initializes an empty `/data/db`.
-Drone removes the old service, attempts to remove the old regular-collection
-volume, and then creates the service with the new `*-timeseries-data` volume.
-If Docker cannot remove the old volume because it lives on another Swarm node,
-the new time series volume is still used and the old volume is left unused for
-manual cleanup or rollback.
+---
+
+# `sleep_segments`
+
+Time-series stage timeline.
+
+| Field | Type | Notes |
+|---|---|---|
+| `device_id` | String | Meta field. |
+| `sleep_date` | String | Day bucket. |
+| `tz_offset_min` | Int | Offset. |
+| `session_id` | String | Parent sleep session. |
+| `protocol` | String | Sleep protocol. |
+| `start_utc` | Date | Time field. |
+| `end_utc` | Date | Segment end. |
+| `stage_code` | Int | Original SDK stage code when supplied. |
+| `stage` | String | Normalized `deep`, `light`, `rem`, `awake`, `off_wrist`, etc. |
+| `source` | String | Source. |
+| `synced_at` | Date | Sync time. |
+
+v3 idempotency:
+
+```text
+device_id + session_id + start_utc
+```
+
+---
+
+# `sleep_summary`
+
+Daily aggregate derived from all `sleep_sessions` for the same device/date.
+
+Additional v3 fields:
+
+```text
+waking_count
+sessions_count
+```
+
+The backend refreshes this row after sleep-session sync. A nap therefore augments the daily summary instead of overwriting main sleep.
+
+---
+
+# `workouts`
+
+Regular upsertable collection matching QRing `SportPlusEntity` semantics.
+
+Important fields:
+
+```text
+device_id
+device_date
+start_utc
+end_utc
+tz_offset_min
+sport_type_id
+sport_type_name
+duration_s
+distance_m
+calories
+avg_hr / min_hr / max_hr
+avg_speed_cm_s / max_speed_cm_s
+elevation_cm
+uphill_cm / downhill_cm
+avg_cadence_spm
+sport_count
+steps
+locations[].rate_real
+status
+metadata
+source
+synced_at
+```
+
+Unique key remains:
+
+```text
+device_id + start_utc
+```
+
+---
+
+# `device_events`
+
+Time-series non-measurement events.
+
+v3 fields:
+
+```text
+device_id
+device_date
+tz_offset_min
+ts_utc
+event_type
+session_id
+source
+payload
+synced_at
+```
+
+Suitable `event_type` values include:
+
+```text
+sedentary
+charging_state
+touch
+gesture
+sport_status
+device_notify
+not_wearing
+```
+
+v3 idempotency:
+
+```text
+device_id + event_type + ts_utc + session_id + source
+```
+
+---
+
+# `raw_sensor_samples`
+
+Short-retention diagnostic time series for raw PPG / accelerometer / vendor channels.
+
+| Field | Type | Notes |
+|---|---|---|
+| `device_id` | String | Meta field. |
+| `device_date` | String | Local day. |
+| `tz_offset_min` | Int | Offset. |
+| `ts_utc` | Date | Sample timestamp. |
+| `session_id` | String | Manual/raw-session correlation. |
+| `sample_index` | Int | Order within a timestamp/session. |
+| `kind` | String | e.g. `ppg_accelerometer`. |
+| `channels` | Object | Flexible numeric map. |
+| `metadata` | Object | Optional SDK metadata. |
+| `source` | String | Usually `qring_sdk_v3`. |
+| `synced_at` | Date | Ingest time. |
+
+The schema deliberately does not invent a formula for SDK `L/H` raw fields. Persist the original numeric channels unless the vendor definition for bit assembly is explicitly known.
+
+Default TTL: **30 days**.
+
+---
+
+# `total_activities`
+
+Daily target/progress records. v3 supports all QRing goal categories rather than only the first three positions.
+
+Recommended kinds:
+
+```text
+steps
+calories
+distance
+sport_duration
+sleep_duration
+```
+
+Fields:
+
+```text
+device_id
+device_uid
+device_date
+kind
+index
+value
+target
+unit
+source
+synced_at
+```
+
+Unique:
+
+```text
+device_id + device_date + kind
+```
+
+---
+
+# `wearable_syncs`
+
+v3 uses this as **sync metadata**, not as the source of truth for historical sensor arrays.
+
+Typical v3 document:
+
+```js
+{
+  device_id: "...",
+  device_uid: "AA:BB:CC:DD:EE:FF",
+  sync_date: "2026-09-16",
+  last_sync_id: "...",
+  source: "qring_sdk_v3",
+  coverage: {
+    daily_activity: true,
+    activity_buckets: 96,
+    measurements: 120,
+    sleep_sessions: 2,
+    sleep_segments: 24,
+    targets: 5,
+    workouts: 1,
+    events: 3,
+    raw_samples: 0
+  },
+  received_at: ISODate(...),
+  created_at: ISODate(...),
+  updated_at: ISODate(...)
+}
+```
+
+Unique:
+
+```text
+device_uid + sync_date
+```
+
+Legacy documents may still contain the old nested `payload`. Housekeeping continues pruning old nested raw arrays for safe migration, but new v3 clients read normalized collections.
+
+---
+
+# Date/time conventions
+
+| Concept | Storage |
+|---|---|
+| Actual instant | UTC BSON `Date` |
+| Device-local day | `YYYY-MM-DD` string |
+| Device offset | `tz_offset_min` integer |
+| 15-minute activity slot | `time_index` `0..95` |
+| Measurement history array position | converted by frontend to `ts` or `minuteOfDay` |
+
+Do not group daily wearable data by UTC midnight. Use `device_date` / `sleep_date`.
+
+Example Jakarta:
+
+```text
+2026-09-17 00:00 +07:00
+= 2026-09-16 17:00Z
+```
+
+Both values describe the same instant; the device-local grouping date is still `2026-09-17`.
+
+---
+
+# Initialization
+
+Mongo image initialization links:
+
+```text
+/docker-entrypoint-initdb.d/00-mongo-init.js
+/docker-entrypoint-initdb.d/10-kala-agem-timeseries.js
+```
+
+The schema script is idempotent for existing compatible collections/indexes.
+
+Backend startup also executes:
+
+```go
+EnsureIndexes(ctx)
+EnsureSDKV3Schema(ctx)
+```
+
+so the backend validates/creates the runtime schema when connecting to an existing environment.
+
+---
+
+# Housekeeping
+
+`src/prepare_db.py` applies:
+
+- `collMod` retention to time-series collections
+- TTL indexes to legacy and v3 key collections
+- 30-day raw-sensor retention
+- legacy `wearable_syncs.payload.*.readings` pruning for pre-overhaul documents
+
+It does not delete long-lived summaries, sessions, workouts, devices, or pairings.
+
+---
+
+# Deployment compatibility
+
+This schema is backward-readable with the old v1 collections, but v3 adds fields and collections. Existing v1 code can ignore extra BSON fields.
+
+Potential migration blocker:
+
+```text
+uniq_user_active_device_v3
+uniq_device_active_owner_v3
+uniq_user_primary_active_v3
+```
+
+If old data violates those ownership rules, clean the duplicate active pairing records before creating the indexes.
+
+---
+
+# Product/SDK scope
+
+The supplied G69 product specification lists heart rate, SpO2, body temperature, step counting, all-day sleep, HRV, female cycle, sedentary reminder, many sport modes, and AI health-monitoring/report features.
+
+The supplied Android AAR additionally exposes generic SDK capabilities such as blood pressure, stress, one-click measurement, raw PPG-related values, device capability flags, battery/charging, and other optional model-dependent functions.
+
+The database therefore stores capability flags dynamically and only persists a measurement when the frontend actually receives it from the device/SDK. Capability support must never be inferred from using the QRing SDK alone.
+
+A dedicated female-cycle or AI-report schema is intentionally not invented here because the supplied SDK documentation does not expose a sufficiently explicit canonical payload for those product-level features.

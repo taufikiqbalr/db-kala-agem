@@ -17,6 +17,7 @@ RAW_TIME_SERIES_COLLECTIONS = (
     ("sleep_segments", "KALA_AGEM_RAW_RETENTION_DAYS", 365),
     ("health_metrics", "KALA_AGEM_RAW_RETENTION_DAYS", 365),
     ("device_events", "KALA_AGEM_EVENT_RETENTION_DAYS", 90),
+    ("raw_sensor_samples", "KALA_AGEM_RAW_SENSOR_RETENTION_DAYS", 30),
 )
 
 KEY_COLLECTIONS = (
@@ -24,8 +25,15 @@ KEY_COLLECTIONS = (
     ("sleep_segments_keys", "ttl_sleep_segments_keys_created_at", "KALA_AGEM_RAW_RETENTION_DAYS", 365),
     ("health_metric_keys", "ttl_health_metric_keys_created_at", "KALA_AGEM_RAW_RETENTION_DAYS", 365),
     ("device_event_keys", "ttl_device_event_keys_created_at", "KALA_AGEM_EVENT_RETENTION_DAYS", 90),
+    ("health_metric_v3_keys", "ttl_health_metric_v3_keys_created_at", "KALA_AGEM_RAW_RETENTION_DAYS", 365),
+    ("sleep_segment_v3_keys", "ttl_sleep_segment_v3_keys_created_at", "KALA_AGEM_RAW_RETENTION_DAYS", 365),
+    ("device_event_v3_keys", "ttl_device_event_v3_keys_created_at", "KALA_AGEM_EVENT_RETENTION_DAYS", 90),
+    ("raw_sensor_sample_keys", "ttl_raw_sensor_sample_keys_created_at", "KALA_AGEM_RAW_SENSOR_RETENTION_DAYS", 30),
 )
 
+# Legacy v3 snapshots created before the SDK-aligned overhaul may contain large
+# nested raw arrays. New v3 writes normalized collections and only keeps sync
+# metadata in wearable_syncs, but this prune remains for safe migration.
 SNAPSHOT_READING_FIELDS = (
     "payload.hrv.readings",
     "payload.heartRate.readings",
@@ -183,13 +191,9 @@ def ensure_ttl_index(db, collection_name, index_name, expire_after_seconds):
     print(f"TTL index set: {collection_name}.{index_name} expireAfterSeconds={expire_after_seconds}")
 
 
-def prune_snapshot_readings(db):
+def prune_legacy_snapshot_readings(db):
     retention = retention_seconds("KALA_AGEM_SNAPSHOT_READING_RETENTION_DAYS", 180)
-    if retention <= 0:
-        print("Snapshot reading pruning disabled")
-        return
-    if "wearable_syncs" not in db.list_collection_names():
-        print("Collection missing, skipping snapshot reading pruning: wearable_syncs")
+    if retention <= 0 or "wearable_syncs" not in db.list_collection_names():
         return
 
     cutoff = (datetime.now(timezone.utc) - timedelta(seconds=retention)).date().isoformat()
@@ -204,7 +208,7 @@ def prune_snapshot_readings(db):
         },
     )
     print(
-        "Snapshot readings pruned: "
+        "Legacy snapshot readings pruned: "
         f"cutoff_sync_date={cutoff} matched={result.matched_count} modified={result.modified_count}"
     )
 
@@ -220,7 +224,7 @@ def prepare_db():
     wait_for_mongo(client)
     db = client[db_name]
 
-    print(f"Preparing AGEM housekeeping in database: {db_name}")
+    print(f"Preparing AGEM/QRing v3 housekeeping in database: {db_name}")
     try:
         for collection_name, env_name, default_days in RAW_TIME_SERIES_COLLECTIONS:
             apply_time_series_retention(db, collection_name, retention_seconds(env_name, default_days))
@@ -228,14 +232,14 @@ def prepare_db():
         for collection_name, index_name, env_name, default_days in KEY_COLLECTIONS:
             ensure_ttl_index(db, collection_name, index_name, key_retention_seconds(env_name, default_days))
 
-        prune_snapshot_readings(db)
+        prune_legacy_snapshot_readings(db)
     except OperationFailure as exc:
         message = exc.details.get("errmsg", str(exc)) if exc.details else str(exc)
         raise SystemExit(f"MongoDB housekeeping failed: {message}") from exc
     finally:
         client.close()
 
-    print("AGEM housekeeping completed successfully.")
+    print("AGEM/QRing v3 housekeeping completed successfully.")
 
 
 prepare_db()
