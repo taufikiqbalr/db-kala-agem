@@ -14,7 +14,7 @@ The schema is aligned with the canonical backend endpoint:
 POST /v3/wearable/sync
 ```
 
-The v3 design stores device-local historical data explicitly and no longer treats one monolithic daily snapshot as the authoritative source. `wearable_syncs` now records sync metadata/coverage while normalized collections hold the real domain data.
+The v3 design stores device-local historical data explicitly and no longer treats one monolithic daily snapshot as the authoritative source. `wearable_syncs` records sync metadata/coverage while normalized collections hold the domain data.
 
 ## Design principles
 
@@ -35,7 +35,7 @@ The v3 design stores device-local historical data explicitly and no longer treat
 |---|---|---|
 | `users` | regular | Local fallback user identity. Canonical identity may come from Regene. |
 | `devices` | regular | Device registry, metadata, capabilities, current battery/charging state. |
-| `user_devices` | regular | Pairing history with active ownership constraints. |
+| `user_devices` | regular | Pairing history with explicit `active` ownership constraints. |
 | `daily_activity` | regular | Device-local daily activity totals. |
 | `steps_15m` | time series | 15-minute activity buckets. |
 | `health_metrics` | time series | Normalized HR/SpO2/BP/HRV/stress/temperature/RRI/battery measurements. |
@@ -117,7 +117,7 @@ idx_devices_last_seen_v3        last_seen_at DESC
 
 # `user_devices`
 
-Pairing history. A row remains after unpairing; `unpaired_at` marks it inactive.
+Pairing history. A row remains after unpairing. The canonical ownership state is the explicit `active` Boolean; `unpaired_at` remains as audit/history metadata.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -126,19 +126,27 @@ Pairing history. A row remains after unpairing; `unpaired_at` marks it inactive.
 | `device_id` | String | AGEM `devices._id` as hex string. |
 | `nickname` | String | Optional UI nickname. |
 | `is_primary` | Boolean | Active primary device flag. |
+| `active` | Boolean | `true` while the pairing owns the device; set `false` on unpair. |
 | `paired_at` | Date | Pair time. |
-| `unpaired_at` | Date | Missing while active. |
+| `unpaired_at` | Date | Audit timestamp written on unpair. |
 
 Indexes:
 
 ```text
 idx_user_devices_user_primary_paired
-uniq_user_active_device_v3   UNIQUE(user_id, device_id) WHERE unpaired_at missing
-uniq_device_active_owner_v3  UNIQUE(device_id)          WHERE unpaired_at missing
-uniq_user_primary_active_v3  UNIQUE(user_id)            WHERE unpaired_at missing AND is_primary=true
+uniq_user_active_device_v3   UNIQUE(user_id, device_id) WHERE active=true
+uniq_device_active_owner_v3  UNIQUE(device_id)          WHERE active=true
+uniq_user_primary_active_v3  UNIQUE(user_id)            WHERE active=true AND is_primary=true
 ```
 
-Migration note: if an existing deployment already has duplicate active pairing rows, the new unique partial indexes will fail to create until those duplicates are resolved.
+MongoDB partial indexes are intentionally based on equality (`active: true`), not `$exists:false`. During schema preparation, legacy rows are backfilled as follows:
+
+```text
+unpaired_at missing -> active=true
+unpaired_at present -> active=false, is_primary=false
+```
+
+Migration note: if an existing deployment already contains multiple active owners for one device or multiple active primary devices for one user, resolve those duplicates before creating the unique partial indexes.
 
 ---
 
@@ -499,6 +507,7 @@ Typical v3 document:
   device_id: "...",
   device_uid: "AA:BB:CC:DD:EE:FF",
   sync_date: "2026-09-16",
+  tz_offset_min: 420,
   last_sync_id: "...",
   source: "qring_sdk_v3",
   coverage: {
@@ -577,10 +586,13 @@ so the backend validates/creates the runtime schema when connecting to an existi
 
 `src/prepare_db.py` applies:
 
-- `collMod` retention to time-series collections
-- TTL indexes to legacy and v3 key collections
-- 30-day raw-sensor retention
-- legacy `wearable_syncs.payload.*.readings` pruning for pre-overhaul documents
+- creates/validates all regular and time-series collections used by v1/v3
+- backfills the explicit `user_devices.active` flag from legacy `unpaired_at` history
+- applies active-owner/primary unique partial indexes using equality filters
+- applies `collMod` retention to time-series collections
+- applies TTL indexes to legacy and v3 key collections
+- applies 30-day raw-sensor retention
+- prunes legacy `wearable_syncs.payload.*.readings` arrays for pre-overhaul documents
 
 It does not delete long-lived summaries, sessions, workouts, devices, or pairings.
 
@@ -590,7 +602,7 @@ It does not delete long-lived summaries, sessions, workouts, devices, or pairing
 
 This schema is backward-readable with the old v1 collections, but v3 adds fields and collections. Existing v1 code can ignore extra BSON fields.
 
-Potential migration blocker:
+Potential migration blockers:
 
 ```text
 uniq_user_active_device_v3
@@ -598,7 +610,7 @@ uniq_device_active_owner_v3
 uniq_user_primary_active_v3
 ```
 
-If old data violates those ownership rules, clean the duplicate active pairing records before creating the indexes.
+If old data violates those ownership rules, clean the duplicate active pairing records before creating the indexes. Schema preparation automatically derives `active` from existing `unpaired_at` values, but it intentionally does not guess how to resolve conflicting ownership.
 
 ---
 
