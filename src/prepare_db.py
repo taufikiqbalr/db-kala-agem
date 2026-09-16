@@ -229,7 +229,12 @@ def apply_time_series_retention(db, collection_name, expire_after_seconds):
 
 
 def ensure_index(db, collection_name, keys, *, name, unique=False, partial_filter=None):
-    kwargs = {"name": name, "unique": unique}
+    # Do not send unique=False explicitly. MongoDB time-series indexes retain an
+    # originalSpec, and an explicit false differs from an omitted option when a
+    # second schema tool re-ensures the same logical index.
+    kwargs = {"name": name}
+    if unique:
+        kwargs["unique"] = True
     if partial_filter is not None:
         kwargs["partialFilterExpression"] = partial_filter
     created_name = db[collection_name].create_index(keys, **kwargs)
