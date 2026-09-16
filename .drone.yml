@@ -1,0 +1,558 @@
+###
+# sync db staging ke test
+# db test untuk fitur baru, jika sudah stabil, merge ke dev
+# reploy tidak perlu pr, tpi langsung push
+
+kind: pipeline
+type: docker
+name: db-kala-agem
+
+trigger:
+  branch:
+  - tstable
+  event:
+    include:
+    - push
+
+steps:
+
+- name: init-db-kala-agem
+  image: hub.regene.xyz/dockerhub_proxy/library/docker
+  environment:
+    DOCKERUSER:
+      from_secret: docker_username
+    DOCKERPASSWD:
+      from_secret: docker_password
+    BUILD_SERVICE: mongo
+    IMAGE: "hub.regene.xyz/regene/mongo-kala-agem-test:latest"
+    PUBLISHED_PORT: "57215"
+    # port internal container,
+    TARGET_PORT: "27017"
+    SERVICE: mongo-kala-agem-test
+    VOLUME: mongo-kala-agem-test-timeseries-data
+    OLD_VOLUME: mongo-kala-agem-test-data
+    NODE_LABEL: db-test
+  commands:
+  # db
+  - docker login -u "$DOCKERUSER"  -p $DOCKERPASSWD hub.regene.xyz
+  # build
+  - docker compose build $BUILD_SERVICE
+  # register
+  - docker tag $BUILD_SERVICE:latest $IMAGE
+  # push
+  # - docker push kuncen-dreg.regene.xyz:5000/$IMAGE
+  - docker push $IMAGE
+  # --mount type=bind,source=$SOURCE_SQL,target=$TARGET_SQL
+  - |
+    echo "Checking Swarm node label: $NODE_LABEL=true"
+    MATCHING_NODES="$(docker node inspect $(docker node ls -q) \
+      --format "{{if eq (index .Spec.Labels \"$NODE_LABEL\") \"true\"}}{{.ID}}{{end}}" | sed '/^$/d')"
+    if [ -z "$MATCHING_NODES" ]; then
+      echo "No Swarm node has required label: $NODE_LABEL=true"
+      echo "Available Swarm node labels:"
+      docker node inspect $(docker node ls -q) \
+        --format 'node={{.Description.Hostname}} availability={{.Spec.Availability}} state={{.Status.State}} labels={{json .Spec.Labels}}' || true
+      exit 1
+    fi
+    docker node inspect $MATCHING_NODES \
+      --format 'Matched node={{.Description.Hostname}} availability={{.Spec.Availability}} state={{.Status.State}} labels={{json .Spec.Labels}}'
+
+    echo "Existing services using published port $PUBLISHED_PORT, if any:"
+    docker service ls --format 'service={{.Name}} ports={{.Ports}}' | grep -E "(^|[^0-9])${PUBLISHED_PORT}([^0-9]|$)" || true
+
+    if [ -n "$(docker service ls -f name=$SERVICE -q)" ]; then
+      docker service rm $SERVICE
+      until [ -z "$(docker service ls -f name=$SERVICE -q)" ]; do
+        sleep 2
+      done
+    fi
+    if [ -n "${OLD_VOLUME:-}" ] && [ "$OLD_VOLUME" != "$VOLUME" ]; then
+      echo "Removing old regular Mongo volume: $OLD_VOLUME"
+      docker volume rm "$OLD_VOLUME" || echo "Old volume $OLD_VOLUME was not removed; it may be absent, in use, or located on another Swarm node."
+    fi
+    docker service create \
+      --detach=true \
+      --publish mode=host,target=$TARGET_PORT,published=$PUBLISHED_PORT \
+      --constraint "node.labels.$NODE_LABEL==true" \
+      --mount type=volume,source=$VOLUME,target=/data/db \
+      --env INIT_DB=init_db_kalaagem_t \
+      --env KALA_AGEM_DB=regene_kalaagem \
+      --env KALA_AGEM_RAW_RETENTION_DAYS=365 \
+      --env KALA_AGEM_EVENT_RETENTION_DAYS=90 \
+      --env KALA_AGEM_KEY_RETENTION_GRACE_DAYS=7 \
+      --env MONGO_INITDB_ROOT_USERNAME_FILE=/run/secrets/mongo_kalaagem_root_user_t \
+      --env MONGO_INITDB_ROOT_PASSWORD_FILE=/run/secrets/mongo_kalaagem_root_pwd_t \
+      --secret=init_db_kalaagem_t \
+      --secret=mongo_kalaagem_root_user_t \
+      --secret=mongo_kalaagem_root_pwd_t \
+      --restart-condition any \
+      --restart-delay 5s \
+      --with-registry-auth \
+      --name $SERVICE $IMAGE
+    for i in $(seq 1 60); do
+      REPLICAS="$(docker service ls -f name=$SERVICE --format '{{.Replicas}}')"
+      if [ "$REPLICAS" = "1/1" ]; then
+        docker service ps --no-trunc $SERVICE
+        exit 0
+      fi
+      echo "Waiting for $SERVICE replicas, current: ${REPLICAS:-missing service}"
+      docker service ps --no-trunc $SERVICE || true
+      sleep 5
+    done
+    echo "$SERVICE did not reach 1/1 replicas in time."
+    docker service ps --no-trunc $SERVICE || true
+    exit 1
+  volumes:
+  - name: sock
+    path: /var/run/docker.sock
+
+- name: db-test-deploy
+  image: hub.regene.xyz/dockerhub_proxy/library/docker
+  environment:
+    DOCKERUSER:
+      from_secret: docker_username
+    DOCKERPASSWD:
+      from_secret: docker_password
+    APP: db-kala-agem-test
+    SERVICE: db-kala-agem-test
+    NODE_LABEL: db-test
+  commands:
+  - docker login -u "$DOCKERUSER"  -p $DOCKERPASSWD hub.regene.xyz
+  # build
+  - docker compose build $APP
+  # register
+  - docker tag $APP:latest hub.regene.xyz/regene/$APP:latest
+  # push
+  # - docker push kuncen-dreg.regene.xyz:5000/$APP:latest
+  - docker push hub.regene.xyz/regene/$APP:latest
+  # - docker system prune --all --volumes -f
+  - |
+    echo "Checking Swarm node label: $NODE_LABEL=true"
+    MATCHING_NODES="$(docker node inspect $(docker node ls -q) \
+      --format "{{if eq (index .Spec.Labels \"$NODE_LABEL\") \"true\"}}{{.ID}}{{end}}" | sed '/^$/d')"
+    if [ -z "$MATCHING_NODES" ]; then
+      echo "No Swarm node has required label: $NODE_LABEL=true"
+      echo "Available Swarm node labels:"
+      docker node inspect $(docker node ls -q) \
+        --format 'node={{.Description.Hostname}} availability={{.Spec.Availability}} state={{.Status.State}} labels={{json .Spec.Labels}}' || true
+      exit 1
+    fi
+    docker node inspect $MATCHING_NODES \
+      --format 'Matched node={{.Description.Hostname}} availability={{.Spec.Availability}} state={{.Status.State}} labels={{json .Spec.Labels}}'
+
+    if [ -n "$(docker service ls -f name=$SERVICE -q)" ]; then
+      docker service rm $SERVICE
+      until [ -z "$(docker service ls -f name=$SERVICE -q)" ]; do
+        sleep 2
+      done
+    fi
+    docker service create \
+      --detach=true \
+      --constraint "node.labels.$NODE_LABEL==true" \
+      --env SRV_ENV=test \
+      --env KALA_AGEM_DB=regene_kalaagem \
+      --env KALA_AGEM_RAW_RETENTION_DAYS=365 \
+      --env KALA_AGEM_EVENT_RETENTION_DAYS=90 \
+      --env KALA_AGEM_KEY_RETENTION_GRACE_DAYS=7 \
+      --env KALA_AGEM_SNAPSHOT_READING_RETENTION_DAYS=180 \
+      --env MONGODB_URI_SECRET=mandor_agem_t \
+      --env MONGODB_ROOT_USER_SECRET=mongo_kalaagem_root_user_t \
+      --env MONGODB_ROOT_PASSWORD_SECRET=mongo_kalaagem_root_pwd_t \
+      --secret=nasabah_upd_kala_agem_t \
+      --secret=mandor_agem_t \
+      --secret=mongo_kalaagem_root_user_t \
+      --secret=mongo_kalaagem_root_pwd_t \
+      --mount type=bind,source=/var/www/berkas_t,target=/var/www/html \
+      --with-registry-auth \
+      --name $SERVICE hub.regene.xyz/regene/$APP:latest
+    for i in $(seq 1 24); do
+      REPLICAS="$(docker service ls -f name=$SERVICE --format '{{.Replicas}}')"
+      if [ "$REPLICAS" = "1/1" ]; then
+        docker service ps --no-trunc $SERVICE
+        exit 0
+      fi
+      echo "Waiting for $SERVICE replicas, current: ${REPLICAS:-missing service}"
+      docker service ps --no-trunc $SERVICE || true
+      sleep 5
+    done
+    echo "$SERVICE did not reach 1/1 replicas in time."
+    docker service ps --no-trunc $SERVICE || true
+    exit 1
+  volumes:
+  - name: sock
+    path: /var/run/docker.sock
+
+volumes:
+- name: sock
+  host:
+    path: /var/run/docker.sock
+
+---
+
+kind: pipeline
+type: docker
+name: db-staging
+
+trigger:
+  branch:
+  - staging
+  event:
+    include:
+    - push
+
+steps:
+
+- name: init-db-kala-agem-staging
+  image: hub.regene.xyz/dockerhub_proxy/library/docker
+  environment:
+    DOCKERUSER:
+      from_secret: docker_username
+    DOCKERPASSWD:
+      from_secret: docker_password
+    BUILD_SERVICE: mongo
+    IMAGE: "hub.regene.xyz/regene/mongo-kala-agem-staging:latest"
+    PUBLISHED_PORT: "37215"
+    TARGET_PORT: "27017"
+    SERVICE: mongo-kala-agem-staging
+    VOLUME: mongo-kala-agem-staging-timeseries-data
+    OLD_VOLUME: mongo-kala-agem-staging-data
+    NODE_LABEL: db-staging
+  commands:
+  - docker login -u "$DOCKERUSER"  -p $DOCKERPASSWD hub.regene.xyz
+  - docker compose build $BUILD_SERVICE
+  - docker tag $BUILD_SERVICE:latest $IMAGE
+  - docker push $IMAGE
+  - |
+    echo "Checking Swarm node label: $NODE_LABEL=true"
+    MATCHING_NODES="$(docker node inspect $(docker node ls -q) \
+      --format "{{if eq (index .Spec.Labels \"$NODE_LABEL\") \"true\"}}{{.ID}}{{end}}" | sed '/^$/d')"
+    if [ -z "$MATCHING_NODES" ]; then
+      echo "No Swarm node has required label: $NODE_LABEL=true"
+      echo "Available Swarm node labels:"
+      docker node inspect $(docker node ls -q) \
+        --format 'node={{.Description.Hostname}} availability={{.Spec.Availability}} state={{.Status.State}} labels={{json .Spec.Labels}}' || true
+      exit 1
+    fi
+    docker node inspect $MATCHING_NODES \
+      --format 'Matched node={{.Description.Hostname}} availability={{.Spec.Availability}} state={{.Status.State}} labels={{json .Spec.Labels}}'
+
+    echo "Existing services using published port $PUBLISHED_PORT, if any:"
+    docker service ls --format 'service={{.Name}} ports={{.Ports}}' | grep -E "(^|[^0-9])${PUBLISHED_PORT}([^0-9]|$)" || true
+    BUSY_SERVICE="$(docker service ls --format '{{.Name}} {{.Ports}}' | awk -v port="$PUBLISHED_PORT" '$0 ~ port {print $1}' | grep -v "^${SERVICE}$" | head -n 1)"
+    if [ -n "$BUSY_SERVICE" ]; then
+      echo "Port $PUBLISHED_PORT is already used by service $BUSY_SERVICE"
+      exit 1
+    fi
+
+    if [ -n "$(docker service ls -f name=$SERVICE -q)" ]; then
+      docker service rm $SERVICE
+      until [ -z "$(docker service ls -f name=$SERVICE -q)" ]; do
+        sleep 2
+      done
+    fi
+    if [ -n "${OLD_VOLUME:-}" ] && [ "$OLD_VOLUME" != "$VOLUME" ]; then
+      echo "Removing old regular Mongo volume: $OLD_VOLUME"
+      docker volume rm "$OLD_VOLUME" || echo "Old volume $OLD_VOLUME was not removed; it may be absent, in use, or located on another Swarm node."
+    fi
+    docker service create \
+      --detach=true \
+      --publish mode=host,target=$TARGET_PORT,published=$PUBLISHED_PORT \
+      --constraint "node.labels.$NODE_LABEL==true" \
+      --mount type=volume,source=$VOLUME,target=/data/db \
+      --env INIT_DB=init_db_kalaagem_s \
+      --env KALA_AGEM_DB=regene_kalaagem \
+      --env KALA_AGEM_RAW_RETENTION_DAYS=365 \
+      --env KALA_AGEM_EVENT_RETENTION_DAYS=90 \
+      --env KALA_AGEM_KEY_RETENTION_GRACE_DAYS=7 \
+      --env MONGO_INITDB_ROOT_USERNAME_FILE=/run/secrets/mongo_kalaagem_root_user_s \
+      --env MONGO_INITDB_ROOT_PASSWORD_FILE=/run/secrets/mongo_kalaagem_root_pwd_s \
+      --secret=init_db_kalaagem_s \
+      --secret=mongo_kalaagem_root_user_s \
+      --secret=mongo_kalaagem_root_pwd_s \
+      --restart-condition any \
+      --restart-delay 5s \
+      --with-registry-auth \
+      --name $SERVICE $IMAGE
+    for i in $(seq 1 60); do
+      REPLICAS="$(docker service ls -f name=$SERVICE --format '{{.Replicas}}')"
+      if [ "$REPLICAS" = "1/1" ]; then
+        docker service ps --no-trunc $SERVICE
+        exit 0
+      fi
+      echo "Waiting for $SERVICE replicas, current: ${REPLICAS:-missing service}"
+      docker service ps --no-trunc $SERVICE || true
+      sleep 5
+    done
+    echo "$SERVICE did not reach 1/1 replicas in time."
+    docker service ps --no-trunc $SERVICE || true
+    exit 1
+  volumes:
+  - name: sock
+    path: /var/run/docker.sock
+
+- name: db-staging-deploy
+  image: hub.regene.xyz/dockerhub_proxy/library/docker
+  environment:
+    DOCKERUSER:
+      from_secret: docker_username
+    DOCKERPASSWD:
+      from_secret: docker_password
+    APP: db-kala-agem-staging
+    SERVICE: db-kala-agem-staging
+    NODE_LABEL: db-staging
+  commands:
+  - docker login -u "$DOCKERUSER"  -p $DOCKERPASSWD hub.regene.xyz
+  - docker compose build $APP
+  - docker tag $APP:latest hub.regene.xyz/regene/$APP:latest
+  - docker push hub.regene.xyz/regene/$APP:latest
+  - |
+    echo "Checking Swarm node label: $NODE_LABEL=true"
+    MATCHING_NODES="$(docker node inspect $(docker node ls -q) \
+      --format "{{if eq (index .Spec.Labels \"$NODE_LABEL\") \"true\"}}{{.ID}}{{end}}" | sed '/^$/d')"
+    if [ -z "$MATCHING_NODES" ]; then
+      echo "No Swarm node has required label: $NODE_LABEL=true"
+      echo "Available Swarm node labels:"
+      docker node inspect $(docker node ls -q) \
+        --format 'node={{.Description.Hostname}} availability={{.Spec.Availability}} state={{.Status.State}} labels={{json .Spec.Labels}}' || true
+      exit 1
+    fi
+    docker node inspect $MATCHING_NODES \
+      --format 'Matched node={{.Description.Hostname}} availability={{.Spec.Availability}} state={{.Status.State}} labels={{json .Spec.Labels}}'
+
+    if [ -n "$(docker service ls -f name=$SERVICE -q)" ]; then
+      docker service rm $SERVICE
+      until [ -z "$(docker service ls -f name=$SERVICE -q)" ]; do
+        sleep 2
+      done
+    fi
+    docker service create \
+      --detach=true \
+      --constraint "node.labels.$NODE_LABEL==true" \
+      --env SRV_ENV=staging \
+      --env KALA_AGEM_DB=regene_kalaagem \
+      --env KALA_AGEM_RAW_RETENTION_DAYS=365 \
+      --env KALA_AGEM_EVENT_RETENTION_DAYS=90 \
+      --env KALA_AGEM_KEY_RETENTION_GRACE_DAYS=7 \
+      --env KALA_AGEM_SNAPSHOT_READING_RETENTION_DAYS=180 \
+      --env MONGODB_URI_SECRET=mandor_agem_s \
+      --env MONGODB_ROOT_USER_SECRET=mongo_kalaagem_root_user_s \
+      --env MONGODB_ROOT_PASSWORD_SECRET=mongo_kalaagem_root_pwd_s \
+      --secret=mandor_agem_s \
+      --secret=mongo_kalaagem_root_user_s \
+      --secret=mongo_kalaagem_root_pwd_s \
+      --mount type=bind,source=/var/www/berkas_s,target=/var/www/html \
+      --with-registry-auth \
+      --name $SERVICE hub.regene.xyz/regene/$APP:latest
+    for i in $(seq 1 24); do
+      REPLICAS="$(docker service ls -f name=$SERVICE --format '{{.Replicas}}')"
+      if [ "$REPLICAS" = "1/1" ]; then
+        docker service ps --no-trunc $SERVICE
+        exit 0
+      fi
+      echo "Waiting for $SERVICE replicas, current: ${REPLICAS:-missing service}"
+      docker service ps --no-trunc $SERVICE || true
+      sleep 5
+    done
+    echo "$SERVICE did not reach 1/1 replicas in time."
+    docker service ps --no-trunc $SERVICE || true
+    exit 1
+  volumes:
+  - name: sock
+    path: /var/run/docker.sock
+
+volumes:
+- name: sock
+  host:
+    path: /var/run/docker.sock
+
+
+---
+
+###
+# sync db staging ke test
+# db test untuk fitur baru, jika sudah stabil, merge ke dev
+# reploy tidak perlu pr, tpi langsung push
+
+kind: pipeline
+type: docker
+name: db-dev
+
+trigger:
+  branch:
+  - staging
+  event:
+    include:
+    - push
+
+steps:
+
+- name: init-db-kala-agem
+  image: hub.regene.xyz/dockerhub_proxy/library/docker
+  environment:
+    DOCKERUSER:
+      from_secret: docker_username
+    DOCKERPASSWD:
+      from_secret: docker_password
+    BUILD_SERVICE: mongo
+    IMAGE: "hub.regene.xyz/regene/mongo-kala-agem-dev:latest"
+    PUBLISHED_PORT: "47215"
+    # port internal container,
+    TARGET_PORT: "27017"
+    SERVICE: mongo-kala-agem-dev
+    VOLUME: mongo-kala-agem-dev-timeseries-data
+    OLD_VOLUME: mongo-kala-agem-dev-data
+    NODE_LABEL: db-dev
+  commands:
+  # db
+  - docker login -u "$DOCKERUSER"  -p $DOCKERPASSWD hub.regene.xyz
+  # build
+  - docker compose build $BUILD_SERVICE
+  # register
+  - docker tag $BUILD_SERVICE:latest $IMAGE
+  # push
+  # - docker push kuncen-dreg.regene.xyz:5000/$IMAGE
+  - docker push $IMAGE
+  # --mount type=bind,source=$SOURCE_SQL,target=$TARGET_SQL
+  - |
+    echo "Checking Swarm node label: $NODE_LABEL=true"
+    MATCHING_NODES="$(docker node inspect $(docker node ls -q) \
+      --format "{{if eq (index .Spec.Labels \"$NODE_LABEL\") \"true\"}}{{.ID}}{{end}}" | sed '/^$/d')"
+    if [ -z "$MATCHING_NODES" ]; then
+      echo "No Swarm node has required label: $NODE_LABEL=true"
+      echo "Available Swarm node labels:"
+      docker node inspect $(docker node ls -q) \
+        --format 'node={{.Description.Hostname}} availability={{.Spec.Availability}} state={{.Status.State}} labels={{json .Spec.Labels}}' || true
+      exit 1
+    fi
+    docker node inspect $MATCHING_NODES \
+      --format 'Matched node={{.Description.Hostname}} availability={{.Spec.Availability}} state={{.Status.State}} labels={{json .Spec.Labels}}'
+
+    echo "Existing services using published port $PUBLISHED_PORT, if any:"
+    docker service ls --format 'service={{.Name}} ports={{.Ports}}' | grep -E "(^|[^0-9])${PUBLISHED_PORT}([^0-9]|$)" || true
+
+    if [ -n "$(docker service ls -f name=$SERVICE -q)" ]; then
+      docker service rm $SERVICE
+      until [ -z "$(docker service ls -f name=$SERVICE -q)" ]; do
+        sleep 2
+      done
+    fi
+    if [ -n "${OLD_VOLUME:-}" ] && [ "$OLD_VOLUME" != "$VOLUME" ]; then
+      echo "Removing old regular Mongo volume: $OLD_VOLUME"
+      docker volume rm "$OLD_VOLUME" || echo "Old volume $OLD_VOLUME was not removed; it may be absent, in use, or located on another Swarm node."
+    fi
+    docker service create \
+      --detach=true \
+      --publish mode=host,target=$TARGET_PORT,published=$PUBLISHED_PORT \
+      --constraint "node.labels.$NODE_LABEL==true" \
+      --mount type=volume,source=$VOLUME,target=/data/db \
+      --env INIT_DB=init_db_kalaagem_d \
+      --env KALA_AGEM_DB=regene_kalaagem \
+      --env KALA_AGEM_RAW_RETENTION_DAYS=365 \
+      --env KALA_AGEM_EVENT_RETENTION_DAYS=90 \
+      --env KALA_AGEM_KEY_RETENTION_GRACE_DAYS=7 \
+      --env MONGO_INITDB_ROOT_USERNAME_FILE=/run/secrets/mongo_kalaagem_root_user_d \
+      --env MONGO_INITDB_ROOT_PASSWORD_FILE=/run/secrets/mongo_kalaagem_root_pwd_d \
+      --secret=init_db_kalaagem_d \
+      --secret=mongo_kalaagem_root_user_d \
+      --secret=mongo_kalaagem_root_pwd_d \
+      --restart-condition any \
+      --restart-delay 5s \
+      --with-registry-auth \
+      --name $SERVICE $IMAGE
+    for i in $(seq 1 60); do
+      REPLICAS="$(docker service ls -f name=$SERVICE --format '{{.Replicas}}')"
+      if [ "$REPLICAS" = "1/1" ]; then
+        docker service ps --no-trunc $SERVICE
+        exit 0
+      fi
+      echo "Waiting for $SERVICE replicas, current: ${REPLICAS:-missing service}"
+      docker service ps --no-trunc $SERVICE || true
+      sleep 5
+    done
+    echo "$SERVICE did not reach 1/1 replicas in time."
+    docker service ps --no-trunc $SERVICE || true
+    exit 1
+  volumes:
+  - name: sock
+    path: /var/run/docker.sock
+
+- name: db-dev-deploy
+  image: hub.regene.xyz/dockerhub_proxy/library/docker
+  environment:
+    DOCKERUSER:
+      from_secret: docker_username
+    DOCKERPASSWD:
+      from_secret: docker_password
+    APP: db-kala-agem-dev
+    SERVICE: db-kala-agem-dev
+    NODE_LABEL: db-dev
+  commands:
+  - docker login -u "$DOCKERUSER"  -p $DOCKERPASSWD hub.regene.xyz
+  # build 
+  - docker compose build $APP
+  # register 
+  - docker tag $APP:latest hub.regene.xyz/regene/$APP:latest
+  # push
+  # - docker push kuncen-dreg.regene.xyz:5000/$APP:latest
+  - docker push hub.regene.xyz/regene/$APP:latest
+  # - docker system prune --all --volumes -f
+  - |
+    echo "Checking Swarm node label: $NODE_LABEL=true"
+    MATCHING_NODES="$(docker node inspect $(docker node ls -q) \
+      --format "{{if eq (index .Spec.Labels \"$NODE_LABEL\") \"true\"}}{{.ID}}{{end}}" | sed '/^$/d')"
+    if [ -z "$MATCHING_NODES" ]; then
+      echo "No Swarm node has required label: $NODE_LABEL=true"
+      echo "Available Swarm node labels:"
+      docker node inspect $(docker node ls -q) \
+        --format 'node={{.Description.Hostname}} availability={{.Spec.Availability}} state={{.Status.State}} labels={{json .Spec.Labels}}' || true
+      exit 1
+    fi
+    docker node inspect $MATCHING_NODES \
+      --format 'Matched node={{.Description.Hostname}} availability={{.Spec.Availability}} state={{.Status.State}} labels={{json .Spec.Labels}}'
+
+    if [ -n "$(docker service ls -f name=$SERVICE -q)" ]; then
+      docker service rm $SERVICE
+      until [ -z "$(docker service ls -f name=$SERVICE -q)" ]; do
+        sleep 2
+      done
+    fi
+    docker service create \
+      --detach=true \
+      --constraint "node.labels.$NODE_LABEL==true" \
+      --env SRV_ENV=dev \
+      --env KALA_AGEM_DB=regene_kalaagem \
+      --env KALA_AGEM_RAW_RETENTION_DAYS=365 \
+      --env KALA_AGEM_EVENT_RETENTION_DAYS=90 \
+      --env KALA_AGEM_KEY_RETENTION_GRACE_DAYS=7 \
+      --env KALA_AGEM_SNAPSHOT_READING_RETENTION_DAYS=180 \
+      --env MONGODB_URI_SECRET=mandor_agem_d \
+      --env MONGODB_ROOT_USER_SECRET=mongo_kalaagem_root_user_d \
+      --env MONGODB_ROOT_PASSWORD_SECRET=mongo_kalaagem_root_pwd_d \
+      --secret=nasabah_upd_kala_agem_d \
+      --secret=mandor_agem_d \
+      --secret=mongo_kalaagem_root_user_d \
+      --secret=mongo_kalaagem_root_pwd_d \
+      --mount type=bind,source=/var/www/berkas_d,target=/var/www/html \
+      --with-registry-auth \
+      --name $SERVICE hub.regene.xyz/regene/$APP:latest
+    for i in $(seq 1 24); do
+      REPLICAS="$(docker service ls -f name=$SERVICE --format '{{.Replicas}}')"
+      if [ "$REPLICAS" = "1/1" ]; then
+        docker service ps --no-trunc $SERVICE
+        exit 0
+      fi
+      echo "Waiting for $SERVICE replicas, current: ${REPLICAS:-missing service}"
+      docker service ps --no-trunc $SERVICE || true
+      sleep 5
+    done
+    echo "$SERVICE did not reach 1/1 replicas in time."
+    docker service ps --no-trunc $SERVICE || true
+    exit 1
+  volumes:
+  - name: sock
+    path: /var/run/docker.sock
+
+volumes:
+- name: sock
+  host:
+    path: /var/run/docker.sock

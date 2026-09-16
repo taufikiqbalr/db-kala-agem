@@ -1,0 +1,16 @@
+# FROM python:3.9-slim
+FROM hub.regene.xyz/dockerhub_proxy/library/mongo:7.0.23-jammy
+
+RUN echo "Asia/Jakarta" > /etc/timezone
+
+WORKDIR /app
+
+COPY ./src/db/init-db.sh ./src/db/init-db.sh
+COPY ./src/db/kala-agem-timeseries.js ./src/db/kala-agem-timeseries.js
+
+RUN chmod +x ./src/db/init-db.sh
+# Keep container running with bash
+# ENTRYPOINT ["src/db/init-db.sh"]
+
+# CMD src/db/init-db.sh && sleep infinity
+CMD ["bash", "-c", "./src/db/init-db.sh && exec docker-entrypoint.sh mongod --bind_ip_all"]

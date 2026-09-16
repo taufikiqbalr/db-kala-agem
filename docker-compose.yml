@@ -1,0 +1,150 @@
+services:
+  berkas:
+    build:
+      context: .
+      dockerfile: Dockerfile-http
+    image: berkas
+    expose:
+      - 80
+    volumes:
+      - .:/app:ro
+  mongo:
+    build:
+      context: .
+      dockerfile: Dockerfile-mongo
+    image: mongo
+    expose:
+      - 27017
+    environment:
+      INIT_DB: init_db_kalaagem_t
+      KALA_AGEM_DB: regene_kalaagem
+      KALA_AGEM_RAW_RETENTION_DAYS: 365
+      KALA_AGEM_EVENT_RETENTION_DAYS: 90
+      KALA_AGEM_KEY_RETENTION_GRACE_DAYS: 7
+      MONGO_INITDB_ROOT_USERNAME_FILE: /run/secrets/mongo_kalaagem_root_user_t
+      MONGO_INITDB_ROOT_PASSWORD_FILE: /run/secrets/mongo_kalaagem_root_pwd_t
+    secrets:
+      - init_db_kalaagem_t
+      - mongo_kalaagem_root_user_t
+      - mongo_kalaagem_root_pwd_t
+    volumes:
+      - .:/app:ro
+      - mongo-kala-agem-timeseries-data:/data/db
+    # command: --auth --bind_ip_all
+  db-kala-agem-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: db-kala-agem-test
+    expose:
+      - 8080
+    environment:
+      SRV_ENV: test
+      KALA_AGEM_DB: regene_kalaagem
+      KALA_AGEM_RAW_RETENTION_DAYS: 365
+      KALA_AGEM_EVENT_RETENTION_DAYS: 90
+      KALA_AGEM_KEY_RETENTION_GRACE_DAYS: 7
+      KALA_AGEM_SNAPSHOT_READING_RETENTION_DAYS: 180
+      MONGODB_URI_SECRET: mandor_agem_t
+      MONGODB_ROOT_USER_SECRET: mongo_kalaagem_root_user_t
+      MONGODB_ROOT_PASSWORD_SECRET: mongo_kalaagem_root_pwd_t
+    secrets:
+      - mandor_agem_t
+      - mongo_kalaagem_root_user_t
+      - mongo_kalaagem_root_pwd_t
+    # ports:
+    # - "127.0.0.1:4001:8080"
+    volumes:
+      - .:/app:ro
+      - /var/www/berkas_t:/var/www/html
+  db-kala-agem-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: db-kala-agem-dev
+    expose:
+      - 8080
+    environment:
+      SRV_ENV: dev
+      KALA_AGEM_DB: regene_kalaagem
+      KALA_AGEM_RAW_RETENTION_DAYS: 365
+      KALA_AGEM_EVENT_RETENTION_DAYS: 90
+      KALA_AGEM_KEY_RETENTION_GRACE_DAYS: 7
+      KALA_AGEM_SNAPSHOT_READING_RETENTION_DAYS: 180
+      MONGODB_URI_SECRET: mandor_agem_d
+      MONGODB_ROOT_USER_SECRET: mongo_kalaagem_root_user_d
+      MONGODB_ROOT_PASSWORD_SECRET: mongo_kalaagem_root_pwd_d
+    secrets:
+      - mandor_agem_d
+      - mongo_kalaagem_root_user_d
+      - mongo_kalaagem_root_pwd_d
+    # ports:
+    # - "127.0.0.1:4001:8080"
+    volumes:
+      - .:/app:ro
+      - /var/www/berkas_d:/var/www/html
+  db-kala-agem-staging:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: db-kala-agem-staging
+    expose:
+      - 8080
+    environment:
+      SRV_ENV: staging
+      KALA_AGEM_DB: regene_kalaagem
+      KALA_AGEM_RAW_RETENTION_DAYS: 365
+      KALA_AGEM_EVENT_RETENTION_DAYS: 90
+      KALA_AGEM_KEY_RETENTION_GRACE_DAYS: 7
+      KALA_AGEM_SNAPSHOT_READING_RETENTION_DAYS: 180
+      MONGODB_URI_SECRET: mandor_agem_s
+      MONGODB_ROOT_USER_SECRET: mongo_kalaagem_root_user_s
+      MONGODB_ROOT_PASSWORD_SECRET: mongo_kalaagem_root_pwd_s
+    secrets:
+      - mandor_agem_s
+      - mongo_kalaagem_root_user_s
+      - mongo_kalaagem_root_pwd_s
+    # ports:
+    # - "127.0.0.1:4001:8080"
+    volumes:
+      - .:/app:ro
+      - /var/www/berkas_s:/var/www/html
+  db-kala-agem-tstable:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: db-kala-agem-tstable
+    expose:
+      - 8080
+    # ports:
+    # - "127.0.0.1:4001:8080"
+    volumes:
+      - .:/app:ro
+      - /var/www/berkas_s:/var/www/html
+
+volumes:
+  mongo-kala-agem-timeseries-data:
+
+secrets:
+  init_db_kalaagem_t:
+    external: true
+  mongo_kalaagem_root_user_t:
+    external: true
+  mongo_kalaagem_root_pwd_t:
+    external: true
+  mandor_agem_t:
+    external: true
+  mandor_agem_d:
+    external: true
+  mongo_kalaagem_root_user_d:
+    external: true
+  mongo_kalaagem_root_pwd_d:
+    external: true
+  init_db_kalaagem_s:
+    external: true
+  mandor_agem_s:
+    external: true
+  mongo_kalaagem_root_user_s:
+    external: true
+  mongo_kalaagem_root_pwd_s:
+    external: true

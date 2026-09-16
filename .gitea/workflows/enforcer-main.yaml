@@ -1,0 +1,18 @@
+name: 'Check main branch'
+
+on:
+  pull_request:
+    branches:
+      - main
+jobs:
+  check_main_branch:
+    runs-on: ubuntu-latest
+    steps:
+      # - name: cek
+        # run: echo "base ${{ gitea.base_ref }} , head ref ${{ gitea.head_ref }}"
+      - name: Check branch
+        if: gitea.base_ref == 'main' && gitea.head_ref != 'staging'
+        # if: gitea.base_ref != 'stable'
+        run: |
+          echo "ERROR: You can only merge to ${{gitea.base_ref}} from ${{ gitea.head_ref }}."
+          exit 1          
