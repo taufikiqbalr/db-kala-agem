@@ -1,0 +1,132 @@
+name: QRing v3 DB CI
+
+on:
+  pull_request:
+    branches:
+      - test
+  push:
+    branches:
+      - qring-v3-sdk-overhaul
+
+permissions:
+  contents: read
+
+jobs:
+  database-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout database repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.0'
+          cache: false
+
+      - name: Python syntax check
+        run: python -m py_compile src/prepare_db.py
+
+      - name: Shell syntax check
+        shell: bash
+        run: |
+          bash -n src/prepare_db.sh
+          bash -n src/db/init-db.sh
+
+      - name: Mongo schema JavaScript syntax check
+        run: node --check src/db/kala-agem-timeseries.js
+
+      - name: Docker Compose validation
+        run: docker compose config >/dev/null
+
+      - name: Install Python dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Start MongoDB 7
+        run: |
+          docker run -d --name kala-agem-ci-mongo -p 27017:27017 mongo:7.0 --bind_ip_all
+          for i in $(seq 1 30); do
+            if docker exec kala-agem-ci-mongo mongosh --quiet --eval 'db.adminCommand({ping:1}).ok' | grep -q 1; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs kala-agem-ci-mongo
+          exit 1
+
+      - name: Apply JavaScript schema
+        shell: bash
+        run: docker exec -i kala-agem-ci-mongo mongosh --quiet < src/db/kala-agem-timeseries.js
+
+      - name: Run Python schema and housekeeping
+        env:
+          MONGODB_URI: mongodb://127.0.0.1:27017/regene_kalaagem
+          KALA_AGEM_DB: regene_kalaagem
+          KALA_AGEM_RAW_RETENTION_DAYS: '365'
+          KALA_AGEM_EVENT_RETENTION_DAYS: '90'
+          KALA_AGEM_RAW_SENSOR_RETENTION_DAYS: '30'
+          KALA_AGEM_KEY_RETENTION_GRACE_DAYS: '7'
+        run: python src/prepare_db.py
+
+      - name: Reapply JavaScript schema (idempotency)
+        shell: bash
+        run: docker exec -i kala-agem-ci-mongo mongosh --quiet < src/db/kala-agem-timeseries.js
+
+      - name: Verify critical collections and indexes
+        shell: bash
+        run: |
+          docker exec kala-agem-ci-mongo mongosh --quiet --eval '
+            const d=db.getSiblingDB("regene_kalaagem");
+            const required=["devices","user_devices","daily_activity","steps_15m","health_metrics","sleep_sessions","sleep_segments","sleep_summary","workouts","device_events","raw_sensor_samples","total_activities","wearable_syncs"];
+            const missing=required.filter(n=>!d.getCollectionNames().includes(n));
+            if(missing.length){throw new Error("missing collections: "+missing.join(","));}
+            const pairingIndexes=d.user_devices.getIndexes().map(x=>x.name);
+            for(const name of ["uniq_user_active_device_v3","uniq_device_active_owner_v3","uniq_user_primary_active_v3"]){
+              if(!pairingIndexes.includes(name)){throw new Error("missing index: "+name);}
+            }
+            print("schema verification OK");
+          '
+
+      - name: Checkout matching backend branch
+        uses: actions/checkout@v4
+        with:
+          repository: taufikiqbalr/agem
+          ref: qring-v3-sdk-overhaul
+          path: agem
+
+      - name: Verify backend accepts DB-prepared schema
+        shell: bash
+        env:
+          ADDR: :18081
+          MONGODB_URI: mongodb://127.0.0.1:27017/regene_kalaagem
+        run: |
+          cd agem
+          nohup go run ./cmd/api >/tmp/agem-cross-schema.log 2>&1 &
+          echo $! >/tmp/agem-cross-schema.pid
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:18081/healthz >/dev/null; then
+              kill "$(cat /tmp/agem-cross-schema.pid)" || true
+              exit 0
+            fi
+            sleep 2
+          done
+          cat /tmp/agem-cross-schema.log
+          exit 1
+
+      - name: Logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          cat /tmp/agem-cross-schema.log || true
+          docker logs kala-agem-ci-mongo || true
